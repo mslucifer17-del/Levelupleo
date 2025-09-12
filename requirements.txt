@@ -2,3 +2,4 @@ python-telegram-bot
 sqlalchemy
 google-generativeai
 python-dotenv  # (Optional, for local testing)
+psycopg2-binary
