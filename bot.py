@@ -16,7 +16,7 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # --- Configuration ---
@@ -46,7 +46,7 @@ class User(Base):
     __tablename__ = 'users'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, unique=True, nullable=False)
+    user_id = Column(BigInteger, unique=True, nullable=False)
     username = Column(String)
     first_name = Column(String, nullable=False)
     
