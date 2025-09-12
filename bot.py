@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # LevelUp Leo Bot - Final Production Code for Web Service Hosting
-# Includes a Flask web server to keep the service alive on Render.com
+# Uses a simpler approach to avoid event loop conflicts
 
 import os
 import logging
@@ -12,20 +12,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import google.generativeai as genai
-from telegram import Update, Sticker, ChatMember, Chat
+from telegram import Update, ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, 
-    ChatMemberHandler, filters
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
-from telegram.constants import ParseMode
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import text
-
-# NEW: Imports for Flask Web Server
-from flask import Flask
-from threading import Thread
-import requests
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -35,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 2. Environment Variables (IMPORTANT: Set these on your server)
+# 2. Environment Variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
@@ -47,7 +39,7 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
+engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -61,7 +53,7 @@ class User(Base):
     level = Column(Integer, default=0)
     messages_count = Column(Integer, default=0)
     prestige = Column(Integer, default=0)
-    hubcoins = Column(Integer, default=10) # Start with 10 coins
+    hubcoins = Column(Integer, default=10)
     reputation = Column(Integer, default=0)
     
     last_message_date = Column(DateTime)
@@ -111,33 +103,15 @@ except Exception as e:
     logger.error(f"Failed to configure Gemini AI: {e}")
     gemini_model = None
 
-# 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
+# 5. Sticker IDs
 LEVEL_STICKERS = {
-    1: "CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE", # Example: Hi
-    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE", # Example: Good
-    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",# Example: Wow
-    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",# Example: Awesome
-    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ", # Example: Pro
-    100: "CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA",# Example: Legend
+    1: "CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE",
+    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE",
+    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",
+    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",
+    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ",
+    100: "CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA",
 }
-
-# NEW: Flask Web Server setup
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    # This route will respond to Render's health checks
-    return "Bot is running!"
-
-@app.route('/health')
-def health():
-    # Additional health check endpoint
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-def run_flask():
-    # Render provides the PORT environment variable
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 # --- Core Bot Logic ---
 
@@ -149,7 +123,7 @@ def get_level_requirements(level: int) -> int:
     elif level <= 50: return 475 + (level - 25) * 50
     else: return 1725 + (level - 50) * 100
 
-def get_or_create_user(session, user_data: Update.effective_user) -> User:
+def get_or_create_user(session, user_data) -> User:
     """Gets a user from the DB or creates a new one."""
     db_user = session.query(User).filter(User.user_id == user_data.id).first()
     if not db_user:
@@ -234,7 +208,7 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db_user.prestige += 1
         db_user.level = 1
         db_user.messages_count = 0
-        db_user.hubcoins += 500 * db_user.prestige # More coins for higher prestige
+        db_user.hubcoins += 500 * db_user.prestige
         session.commit()
 
         prestige_badge = '🌟' * db_user.prestige
@@ -254,16 +228,13 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for member in update.message.new_chat_members:
         session = Session()
         try:
-            get_or_create_user(session, member) # User ko DB mein add karein
+            get_or_create_user(session, member)
             welcome_text = (
                 f"Hey {member.first_name}, welcome to ThePromotionHub! 🎉\n\n"
                 f"Right now your level is 0. Start messaging and grow your level 🚀."
             )
             await update.message.reply_text(welcome_text)
-
-            # Har message ke baad 1 second ka intezar karein
-            await asyncio.sleep(1) 
-
+            await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Welcome message error for {member.id}: {e}")
         finally:
@@ -271,7 +242,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.from_user or update.effective_chat.id != GROUP_ID:
-        return # Process messages only from the main group
+        return
 
     session = Session()
     try:
@@ -280,7 +251,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Update counts
         db_user.messages_count += 1
         db_user.last_message_date = datetime.now()
-        db_user.hubcoins += random.randint(1, 3) # Earn 1-3 coins per message
+        db_user.hubcoins += random.randint(1, 3)
         
         # Level Up Check
         old_level = db_user.level
@@ -290,7 +261,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         if new_level > old_level:
             db_user.level = new_level
-            db_user.hubcoins += new_level * 10 # Bonus coins on level up
+            db_user.hubcoins += new_level * 10
             
             # Send Gemini message
             level_up_text = await generate_level_up_message(new_level, db_user.first_name)
@@ -346,7 +317,7 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
             
             db_user.hubcoins -= 1000
-            db_user.custom_title = title_text[:20] # Max 20 chars
+            db_user.custom_title = title_text[:20]
             db_user.custom_title_expiry = datetime.now() + timedelta(days=7)
             session.commit()
             await update.message.reply_text(f"Badhai ho! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
@@ -411,7 +382,7 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         if priority_user:
             selected_user = priority_user
-            selected_user.spotlight_priority = False # Reset after use
+            selected_user.spotlight_priority = False
             logger.info(f"Spotlight priority user found: {selected_user.first_name}")
         else:
             # Select a random active user from the last 7 days
@@ -437,34 +408,10 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
-# Network error handling
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling an update: {context.error}")
-    
-    # Check if it's a network error
-    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
-        logger.warning("Network error detected, waiting before retrying...")
-        await asyncio.sleep(5)  # Wait before retrying
-
 # --- Main Application ---
 def main() -> None:
-    # NEW: Start the Flask web server in a separate thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Create the Telegram bot application with connection pooling
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .pool_timeout(30)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
+    # Create the Telegram bot application
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add all command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -473,7 +420,7 @@ def main() -> None:
     application.add_handler(CommandHandler("prestige", prestige_command))
     application.add_handler(CommandHandler("shop", shop_command))
     application.add_handler(CommandHandler("buy", buy_command))
-    application.add_handler(CommandHandler("coins", stats_command)) # /coins will also show stats
+    application.add_handler(CommandHandler("coins", stats_command))
     application.add_handler(CommandHandler("rep", rep_command))
 
     # Add message handler for leveling up
@@ -489,32 +436,13 @@ def main() -> None:
 
     logger.info("Starting bot polling...")
     
-    # Implement retry logic for network issues
-    max_retries = 5
-    retry_delay = 10  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            application.run_polling(
-                poll_interval=1.0,  # Increased poll interval
-                timeout=30,         # Increased timeout
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
-            break  # If successful, break out of the loop
-        except Exception as e:
-            if "network" in str(e).lower() or "connection" in str(e).lower():
-                logger.error(f"Network error on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.error("Max retries exceeded. Exiting.")
-                    raise
-            else:
-                # Re-raise if it's not a network error
-                raise
+    # Simple polling without complex retry logic
+    application.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == '__main__':
     main()
