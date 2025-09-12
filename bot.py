@@ -16,8 +16,17 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import BigInteger
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, unique=True, nullable=False)  # ✅ This will store large Telegram IDs
+    username = Column(String)
+    first_name = Column(String, nullable=False)
+    ...
+
 
 # NEW: Imports for Flask Web Server
 from flask import Flask
