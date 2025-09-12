@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+
+# LevelUp Leo Bot - Final Production Code
+# A comprehensive gamification bot for Telegram groups.
+
 import os
 import logging
 import random
@@ -11,380 +16,375 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Configure logging
+# --- Configuration ---
+# 1. Logging Setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Database setup
+# 2. Environment Variables (IMPORTANT: Set these on your server)
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
+GROUP_ID = int(os.environ.get('GROUP_ID', 0))
+
+if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
+    logger.critical("CRITICAL ERROR: BOT_TOKEN, GEMINI_API_KEY, or GROUP_ID is missing!")
+    exit()
+
+# 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db'))
+engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
     __tablename__ = 'users'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, unique=True)
+    user_id = Column(Integer, unique=True, nullable=False)
     username = Column(String)
-    first_name = Column(String)
-    last_name = Column(String)
+    first_name = Column(String, nullable=False)
+    
     level = Column(Integer, default=0)
     messages_count = Column(Integer, default=0)
     prestige = Column(Integer, default=0)
-    hubcoins = Column(Integer, default=0)
+    hubcoins = Column(Integer, default=10) # Start with 10 coins
+    reputation = Column(Integer, default=0)
+    
     last_message_date = Column(DateTime)
+    join_date = Column(DateTime, default=datetime.now)
+    
+    # Shop & Perks
     vip_member = Column(Boolean, default=False)
     custom_title = Column(String, default="")
+    custom_title_expiry = Column(DateTime)
+    spotlight_priority = Column(Boolean, default=False)
+    
+    def get_display_name(self):
+        title = f" [{self.custom_title}]" if self.custom_title else ""
+        prestige_badge = '🌟' * self.prestige if self.prestige > 0 else ''
+        return f"{self.first_name}{title}{prestige_badge}"
 
-# Create tables
 Base.metadata.create_all(engine)
 
-# Configuration
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-GROUP_ID = int(os.environ.get('GROUP_ID', 0))  # Your group ID
+# 4. Gemini AI Initialization
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel('gemini-pro')
+except Exception as e:
+    logger.error(f"Failed to configure Gemini AI: {e}")
+    gemini_model = None
 
-# Initialize Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-pro')
-
-# Sticker IDs for different levels (replace with your actual sticker IDs)
+# 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
-    1: "CAACAgIAAxkBAAEL...",  # Sticker for level 1
-    5: "CAACAgIAAxkBAAEL...",  # Sticker for level 5
-    10: "CAACAgIAAxkBAAEL...", # Sticker for level 10
-    25: "CAACAgIAAxkBAAEL...", # Sticker for level 25
-    50: "CAACAgIAAxkBAAEL...", # Sticker for level 50
-    100: "CAACAgIAAxkBAAEL...", # Sticker for level 100
+    1: "CAACAgIAAxkBAAENpQZk_0e-vj2QW_Gzob0e-VzO_j7IAgACIQADwZxgDGWWb_TEi5iKLwQ", # Example: Hi
+    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE", # Example: Good
+    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",# Example: Wow
+    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",# Example: Awesome
+    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ", # Example: Pro
+    100: "CAACAgIAAxkBAAECZnxow7pJgs1gCyIwzTGK1Mf7K_Y1IwACChkAAk4fiEks87uCYi_pljYE",# Example: Legend
 }
 
-# Level requirements - progressive system
+# --- Core Bot Logic ---
+
+# 1. Helper Functions
 def get_level_requirements(level: int) -> int:
-    if level <= 10:
-        return level * 10
-    elif level <= 25:
-        return 100 + (level - 10) * 25
-    elif level <= 50:
-        return 475 + (level - 25) * 50
-    else:
-        return 1725 + (level - 50) * 100
+    """Calculates total messages needed for a certain level using a progressive formula."""
+    if level <= 10: return level * 10
+    elif level <= 25: return 100 + (level - 10) * 25
+    elif level <= 50: return 475 + (level - 25) * 50
+    else: return 1725 + (level - 50) * 100
 
-# Calculate current level based on message count
-def calculate_level(message_count: int) -> Tuple[int, int]:
-    level = 0
-    while message_count >= get_level_requirements(level + 1):
-        level += 1
-    return level, get_level_requirements(level + 1) - message_count
-
-# Generate level up message using Gemini
-async def generate_level_up_message(level: int, username: str) -> str:
-    prompt = f"Write a short, funny, and motivating message in Hinglish for a user {username} who just reached Level {level} in a promotion group. Mention the level number and keep it under 200 characters."
-    
-    try:
-        response = await gemini_model.generate_content_async(prompt)
-        return response.text
-    except Exception as e:
-        logger.error(f"Error generating Gemini message: {e}")
-        return f"Congratulations {username}! You've reached level {level}! 🎉"
-
-# Welcome message for new users
-async def send_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    welcome_text = (
-        f"Hey {user.first_name}, welcome to ThePromotionHub! "
-        f"Hmm, tumhari level to 0 hai. Message karo or apni level up karo 💪."
-    )
-    
-    await update.message.reply_text(welcome_text)
-    
-    # Add user to database
-    session = Session()
-    try:
-        if not session.query(User).filter(User.user_id == user.id).first():
-            new_user = User(
-                user_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-                level=0,
-                messages_count=0,
-                hubcoins=10  # Starting bonus
-            )
-            session.add(new_user)
-            session.commit()
-    except Exception as e:
-        logger.error(f"Error adding user to database: {e}")
-    finally:
-        session.close()
-
-# Handle messages and update levels
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user:
-        return
-        
-    user = update.effective_user
-    session = Session()
-    
-    try:
-        # Get or create user
-        db_user = session.query(User).filter(User.user_id == user.id).first()
-        if not db_user:
-            db_user = User(
-                user_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
-                level=0,
-                messages_count=0,
-                hubcoins=10
-            )
-            session.add(db_user)
-        
-        # Update message count
-        db_user.messages_count += 1
-        db_user.last_message_date = datetime.now()
-        
-        # Award HubCoins (1-3 per message)
-        db_user.hubcoins += random.randint(1, 3)
-        
-        # Check for level up
-        old_level = db_user.level
-        new_level, remaining = calculate_level(db_user.messages_count)
-        
-        if new_level > old_level:
-            db_user.level = new_level
-            
-            # Send level up message
-            level_up_text = await generate_level_up_message(new_level, user.first_name)
-            await update.message.reply_text(level_up_text)
-            
-            # Send sticker if available for this level
-            if new_level in LEVEL_STICKERS:
-                await update.message.reply_sticker(LEVEL_STICKERS[new_level])
-            
-            # Check for prestige eligibility
-            if new_level >= 100 and not db_user.prestige:
-                prestige_text = (
-                    f"🎉 Amazing {user.first_name}! You've reached Level 100! 🎉\n\n"
-                    f"Would you like to prestige and start over with special benefits? "
-                    f"Use /prestige to reset to Level 1 with a prestige badge! 🌟"
-                )
-                await update.message.reply_text(prestige_text)
-            
-            # Award bonus HubCoins for leveling up
-            db_user.hubcoins += new_level * 5
-        
+def get_or_create_user(session, user_data: Update.effective_user) -> User:
+    """Gets a user from the DB or creates a new one."""
+    db_user = session.query(User).filter(User.user_id == user_data.id).first()
+    if not db_user:
+        db_user = User(
+            user_id=user_data.id,
+            username=user_data.username,
+            first_name=user_data.first_name,
+        )
+        session.add(db_user)
         session.commit()
+    return db_user
+
+async def generate_level_up_message(level: int, username: str) -> str:
+    """Generates a unique level-up message using Gemini AI."""
+    if not gemini_model:
+        return f"Woooah {username}! Aap Level {level} par pahunch gaye! Keep it up! 🔥"
         
-        # Occasionally show progress
-        if random.random() < 0.05:  # 5% chance
-            progress_text = (
-                f"{user.first_name}, you're at Level {db_user.level} "
-                f"with {db_user.messages_count} messages. "
-                f"Next level in {remaining} messages! 💪"
-            )
-            await update.message.reply_text(progress_text)
-            
+    prompt = f"Write a very short, cool, and motivating message in Hinglish for a user named '{username}' who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
+    try:
+        response = await gemini_model.generate_content_async(prompt, safety_settings={'HARASSMENT':'block_none'})
+        return response.text.strip()
     except Exception as e:
-        logger.error(f"Error updating user: {e}")
+        logger.error(f"Gemini Error: {e}")
+        return f"Woooah {username}! Aap Level {level} par pahunch gaye! Keep it up! 🔥"
+
+# 2. Command Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao! /help se saare commands dekho.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "📜 **LevelUp Leo Commands** 📜\n\n"
+        "`/stats` - Apni level, coins aur progress dekho.\n"
+        "`/coins` - Apne HubCoins ka balance dekho.\n"
+        "`/shop` - Dekho ki tum HubCoins se kya khareed sakte ho.\n"
+        "`/buy [item]` - Shop se kuch khareedo (e.g., `/buy title`)\n"
+        "`/prestige` - Level 100 ke baad special badge ke liye level reset karo.\n"
+        "Reply to a message with `/rep` to give reputation to a user."
+    )
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = Session()
+    try:
+        db_user = get_or_create_user(session, update.effective_user)
+        
+        req_for_next = get_level_requirements(db_user.level + 1)
+        messages_for_next = req_for_next - db_user.messages_count
+        
+        stats_text = (
+            f"📊 **{db_user.get_display_name()}'s Stats**\n\n"
+            f"• **Level:** {db_user.level}\n"
+            f"• **Messages:** {db_user.messages_count}\n"
+            f"• **HubCoins:** {db_user.hubcoins} 💰\n"
+            f"• **Reputation:** {db_user.reputation} 👍\n"
+            f"• **Next Level:** in {messages_for_next} messages.\n"
+            f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}"
+        )
+        await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
     finally:
         session.close()
 
-# Prestige command
 async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
     session = Session()
-    
     try:
-        db_user = session.query(User).filter(User.user_id == user.id).first()
-        if not db_user:
-            await update.message.reply_text("You need to send some messages first!")
-            return
-            
+        db_user = get_or_create_user(session, update.effective_user)
         if db_user.level < 100:
-            await update.message.reply_text("You need to reach Level 100 before you can prestige!")
+            await update.message.reply_text("Prestige ke liye Level 100 tak pahunchna zaroori hai!")
             return
-            
-        if db_user.prestige > 0:
-            await update.message.reply_text(f"You already have {db_user.prestige} prestige levels! 🌟")
-            return
-            
-        # Reset level but increase prestige
+
         db_user.prestige += 1
         db_user.level = 1
         db_user.messages_count = 0
+        db_user.hubcoins += 500 * db_user.prestige # More coins for higher prestige
+        session.commit()
+
+        prestige_badge = '🌟' * db_user.prestige
+        await update.message.reply_text(
+            f"🎊 CONGRATULATIONS, {db_user.first_name}! 🎊\n\n"
+            f"Aapne Prestige {db_user.prestige} haasil kar liya hai! {prestige_badge}\n"
+            f"Aapki level reset ho gayi hai, aur aapko {500 * db_user.prestige} HubCoins ka bonus mila hai. Keep rocking!"
+        )
+    finally:
+        session.close()
+
+# 3. Message and Member Handlers
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    for member in update.message.new_chat_members:
+        session = Session()
+        try:
+            get_or_create_user(session, member) # Add user to DB on join
+            welcome_text = (
+                f"Hey {member.first_name}, welcome to ThePromotionHub!\n\n"
+                f"Hmm, tumhari level to 0 hai. Message karo aur apni level up karo 💪."
+            )
+            await update.message.reply_text(welcome_text)
+        finally:
+            session.close()
+            
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != GROUP_ID: return # Process messages only from the main group
+
+    session = Session()
+    try:
+        db_user = get_or_create_user(session, update.effective_user)
         
-        # Award bonus HubCoins for prestiging
-        db_user.hubcoins += 500
+        # Update counts
+        db_user.messages_count += 1
+        db_user.last_message_date = datetime.now()
+        db_user.hubcoins += random.randint(1, 3) # Earn 1-3 coins per message
+        
+        # Level Up Check
+        old_level = db_user.level
+        new_level = 0
+        while db_user.messages_count >= get_level_requirements(new_level + 1):
+            new_level += 1
+        
+        if new_level > old_level:
+            db_user.level = new_level
+            db_user.hubcoins += new_level * 10 # Bonus coins on level up
+            
+            # Send Gemini message
+            level_up_text = await generate_level_up_message(new_level, db_user.first_name)
+            await update.message.reply_text(level_up_text)
+            
+            # Send Sticker
+            if new_level in LEVEL_STICKERS:
+                await update.message.reply_sticker(LEVEL_STICKERS[new_level])
+            
+            # Prestige Prompt at Level 100
+            if new_level == 100:
+                await update.message.reply_text("🎉 Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
         
         session.commit()
-        
-        prestige_text = (
-            f"🎊 Congratulations {user.first_name}! 🎊\n\n"
-            f"You've prestiged and are now back at Level 1 with a prestige badge! 🌟\n"
-            f"You've received 500 HubCoins as a bonus!\n\n"
-            f"Your dedication is impressive! Keep leveling up!"
-        )
-        
-        await update.message.reply_text(prestige_text)
-        
-    except Exception as e:
-        logger.error(f"Error processing prestige: {e}")
     finally:
         session.close()
 
-# Shop command
+# 4. Economy and Advanced Features
 async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     shop_text = (
-        "🛒 Welcome to ThePromotionHub Shop! 🛒\n\n"
-        "Here's what you can buy with your HubCoins:\n\n"
-        "🌟 Spotlight Promotion - 500 Coins\n"
-        "   Get your content featured in the group spotlight\n\n"
-        "🎖️ Custom Title - 1000 Coins\n"
-        "   Get a custom title next to your name for a week\n\n"
-        "💎 VIP Access - 5000 Coins\n"
-        "   Get access to exclusive VIP features\n\n"
-        "Use /buy [item] to purchase something!\n"
-        "Check your coins with /coins"
+        "🛒 **ThePromotionHub Shop** 🛒\n\n"
+        "Apne HubCoins se yeh items khareedo:\n\n"
+        "1. **Title** (1000 Coins) - Ek hafte ke liye custom title.\n"
+        "   `/buy title [Your Title]`\n\n"
+        "2. **Spotlight** (2500 Coins) - Agle din ke spotlight mein guaranteed jagah.\n"
+        "   `/buy spotlight`\n\n"
+        "3. **VIP** (10000 Coins) - Permanent VIP status aur special perks.\n"
+        "   `/buy vip`"
     )
-    
-    await update.message.reply_text(shop_text)
+    await update.message.reply_text(shop_text, parse_mode=ParseMode.MARKDOWN)
 
-# Coins command
-async def coins_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text("Kya khareedna hai? Example: `/buy title My Awesome Title`")
+        return
+
+    item = args[0].lower()
     session = Session()
-    
     try:
-        db_user = session.query(User).filter(User.user_id == user.id).first()
-        if not db_user:
-            await update.message.reply_text("You don't have any HubCoins yet. Start chatting to earn some!")
-            return
+        db_user = get_or_create_user(session, update.effective_user)
+        
+        if item == "title":
+            title_text = " ".join(args[1:])
+            if not title_text:
+                await update.message.reply_text("Title likhna zaroori hai. Example: `/buy title The King`")
+                return
+            if db_user.hubcoins < 1000:
+                await update.message.reply_text(f"Iske liye 1000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                return
             
-        coins_text = (
-            f"{user.first_name}, you have {db_user.hubcoins} HubCoins! 💰\n\n"
-            f"Visit the shop with /shop to see what you can buy!"
-        )
+            db_user.hubcoins -= 1000
+            db_user.custom_title = title_text[:20] # Max 20 chars
+            db_user.custom_title_expiry = datetime.now() + timedelta(days=7)
+            session.commit()
+            await update.message.reply_text(f"Badhai ho! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
+
+        elif item == "spotlight":
+            if db_user.hubcoins < 2500:
+                await update.message.reply_text(f"Iske liye 2500 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                return
+            db_user.hubcoins -= 2500
+            db_user.spotlight_priority = True
+            session.commit()
+            await update.message.reply_text("Kharidari safal! Aapko agle spotlight mein priority di jayegi. 🌟")
+            
+        elif item == "vip":
+            if db_user.hubcoins < 10000:
+                await update.message.reply_text(f"Iske liye 10000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                return
+            db_user.hubcoins -= 10000
+            db_user.vip_member = True
+            session.commit()
+            await update.message.reply_text("Welcome to the VIP club! 🎖️ Aapko ab special perks milenge.")
         
-        await update.message.reply_text(coins_text)
-        
-    except Exception as e:
-        logger.error(f"Error checking coins: {e}")
+        else:
+            await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekeho.")
     finally:
         session.close()
 
-# Spotlight feature
+async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Yeh command kisi message ko reply karke istemal karein.")
+        return
+        
+    giver = update.effective_user
+    receiver = update.message.reply_to_message.from_user
+    
+    if giver.id == receiver.id:
+        await update.message.reply_text("Aap khud ko reputation nahi de sakte!")
+        return
+        
+    session = Session()
+    try:
+        db_receiver = get_or_create_user(session, receiver)
+        db_receiver.reputation += 1
+        session.commit()
+        await update.message.reply_to_message.reply_text(f"{receiver.first_name} ki reputation {giver.first_name} ne badhai! Current reputation: {db_receiver.reputation} 👍")
+    finally:
+        session.close()
+
+# 5. Scheduled Jobs
 async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Running daily spotlight job...")
     session = Session()
-    
     try:
-        # Find an active user from the last 7 days
-        one_week_ago = datetime.now() - timedelta(days=7)
-        active_users = session.query(User).filter(
-            User.last_message_date >= one_week_ago
-        ).all()
+        # Prioritize users who bought the spotlight
+        priority_user = session.query(User).filter(User.spotlight_priority == True).order_by(func.random()).first()
         
-        if not active_users:
-            return
-            
-        # Select a random active user
-        selected_user = random.choice(active_users)
+        if priority_user:
+            selected_user = priority_user
+            selected_user.spotlight_priority = False # Reset after use
+            logger.info(f"Spotlight priority user found: {selected_user.first_name}")
+        else:
+            # Select a random active user from the last 7 days
+            one_week_ago = datetime.now() - timedelta(days=7)
+            active_users = session.query(User).filter(User.last_message_date >= one_week_ago).all()
+            if not active_users: 
+                logger.info("No active users found for spotlight.")
+                return
+            selected_user = random.choice(active_users)
+            logger.info(f"Spotlight random user found: {selected_user.first_name}")
         
-        # Get user info
-        try:
-            chat_member = await context.bot.get_chat_member(GROUP_ID, selected_user.user_id)
-            username = f"@{chat_member.user.username}" if chat_member.user.username else chat_member.user.first_name
-        except:
-            username = selected_user.first_name
-        
-        # Create spotlight message
         spotlight_text = (
-            f"🌟 Today's Spotlight Member is {username}! 🌟\n\n"
-            f"This active member is Level {selected_user.level} "
-            f"with {selected_user.prestige} prestige levels!\n\n"
-            f"Let's all give them some support and check out their content!\n\n"
-            f"Want to be in the spotlight? Stay active in the group!"
+            f"🌟 **Aaj ke Spotlight Member hain {selected_user.get_display_name()}!** 🌟\n\n"
+            f"Yeh hamare group ke ek bahut active sadasya hain (Level: {selected_user.level}).\n\n"
+            f"Chaliye, aaj hum sab milkar inko support karte hain! "
+            f"Inke content ko check karein aur feedback dein!"
         )
         
-        # Send spotlight message
-        await context.bot.send_message(
-            chat_id=GROUP_ID,
-            text=spotlight_text,
-            parse_mode=ParseMode.HTML
-        )
-        
+        await context.bot.send_message(chat_id=GROUP_ID, text=spotlight_text, parse_mode=ParseMode.MARKDOWN)
+        session.commit()
     except Exception as e:
-        logger.error(f"Error with spotlight feature: {e}")
+        logger.error(f"Spotlight Error: {e}")
     finally:
         session.close()
 
-# Stats command
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    session = Session()
-    
-    try:
-        db_user = session.query(User).filter(User.user_id == user.id).first()
-        if not db_user:
-            await update.message.reply_text("You haven't started your journey yet! Send a message to begin.")
-            return
-            
-        next_level_req = get_level_requirements(db_user.level + 1)
-        progress = min(100, int((db_user.messages_count / next_level_req) * 100)) if next_level_req > 0 else 100
-        
-        stats_text = (
-            f"📊 {user.first_name}'s Stats:\n\n"
-            f"• Level: {db_user.level} {'🌟' * db_user.prestige}\n"
-            f"• Messages: {db_user.messages_count}\n"
-            f"• HubCoins: {db_user.hubcoins} 💰\n"
-            f"• Progress to next level: {progress}%\n"
-            f"• VIP Status: {'Yes 🎖️' if db_user.vip_member else 'No'}\n"
-        )
-        
-        if db_user.custom_title:
-            stats_text += f"• Custom Title: {db_user.custom_title}\n"
-        
-        await update.message.reply_text(stats_text)
-        
-    except Exception as e:
-        logger.error(f"Error with stats command: {e}")
-    finally:
-        session.close()
-
-# Error handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
-# Main function
+# --- Main Application ---
 def main() -> None:
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", send_welcome_message))
+    # Add all command handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("prestige", prestige_command))
     application.add_handler(CommandHandler("shop", shop_command))
-    application.add_handler(CommandHandler("coins", coins_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    
-    # Handle all text messages except commands
+    application.add_handler(CommandHandler("buy", buy_command))
+    application.add_handler(CommandHandler("coins", stats_command)) # /coins will also show stats
+    application.add_handler(CommandHandler("rep", rep_command))
+
+    # Add message handler for leveling up
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Error handler
-    application.add_error_handler(error_handler)
+    # Add handler for new members
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     
-    # Job queue for periodic tasks (like spotlight)
+    # Add job queue for spotlight
     job_queue = application.job_queue
+    # Run spotlight every 24 hours
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
-    
-    # Start the bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    logger.info("Starting bot...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
