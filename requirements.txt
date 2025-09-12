@@ -1,5 +1,6 @@
 python-telegram-bot[job-queue]
 sqlalchemy
 google-generativeai
-python-dotenv  # (Optional, for local testing)
+python-dotenv
 psycopg2-binary
+Flask
