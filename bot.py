@@ -6,6 +6,7 @@
 import os
 import logging
 import random
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -16,17 +17,9 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from sqlalchemy import BigInteger
-
-class User(Base):
-    __tablename__ = 'users'
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, unique=True, nullable=False)  # ✅ This will store large Telegram IDs
-    username = Column(String)
-    first_name = Column(String, nullable=False)
-    ...
-
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, Text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import text
 
 # NEW: Imports for Flask Web Server
 from flask import Flask
@@ -60,8 +53,8 @@ class User(Base):
     
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, unique=True, nullable=False)
-    username = Column(String)
-    first_name = Column(String, nullable=False)
+    username = Column(String(255))
+    first_name = Column(String(255), nullable=False)
     
     level = Column(Integer, default=0)
     messages_count = Column(Integer, default=0)
@@ -74,7 +67,7 @@ class User(Base):
     
     # Shop & Perks
     vip_member = Column(Boolean, default=False)
-    custom_title = Column(String, default="")
+    custom_title = Column(String(50), default="")
     custom_title_expiry = Column(DateTime)
     spotlight_priority = Column(Boolean, default=False)
     
@@ -83,7 +76,30 @@ class User(Base):
         prestige_badge = '🌟' * self.prestige if self.prestige > 0 else ''
         return f"{self.first_name}{title}{prestige_badge}"
 
+# Function to check and alter table if needed
+def check_and_alter_table():
+    try:
+        with engine.connect() as conn:
+            # Check if user_id column is INTEGER type
+            result = conn.execute(text("""
+                SELECT data_type 
+                FROM information_schema.columns 
+                WHERE table_name = 'users' AND column_name = 'user_id';
+            """))
+            row = result.fetchone()
+            if row and row[0] == 'integer':
+                logger.info("Changing user_id column from integer to bigint")
+                conn.execute(text("ALTER TABLE users ALTER COLUMN user_id TYPE BIGINT;"))
+                conn.commit()
+                logger.info("Column type changed successfully")
+    except Exception as e:
+        logger.error(f"Error checking/altering table: {e}")
+
+# Create tables and check column types
 Base.metadata.create_all(engine)
+# Check if we need to alter the user_id column for PostgreSQL
+if DATABASE_URL.startswith('postgresql'):
+    check_and_alter_table()
 
 # 4. Gemini AI Initialization
 try:
@@ -136,7 +152,15 @@ def get_or_create_user(session, user_data: Update.effective_user) -> User:
             first_name=user_data.first_name or "User",
         )
         session.add(db_user)
-        session.commit()
+        try:
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error creating user: {e}")
+            # Try to get user again in case of race condition
+            db_user = session.query(User).filter(User.user_id == user_data.id).first()
+            if not db_user:
+                raise e
     return db_user
 
 async def generate_level_up_message(level: int, username: str) -> str:
@@ -174,7 +198,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db_user = get_or_create_user(session, update.effective_user)
         
         req_for_next = get_level_requirements(db_user.level + 1)
-        messages_for_next = req_for_next - db_user.messages_count
+        messages_for_next = max(0, req_for_next - db_user.messages_count)
         
         stats_text = (
             f"📊 **{db_user.get_display_name()}'s Stats**\n\n"
@@ -186,6 +210,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}"
         )
         await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Error in stats command: {e}")
+        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
     finally:
         session.close()
 
@@ -209,6 +236,9 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Aapne Prestige {db_user.prestige} haasil kar liya hai! {prestige_badge}\n"
             f"Aapki level reset ho gayi hai, aur aapko {500 * db_user.prestige} HubCoins ka bonus mila hai. Keep rocking!"
         )
+    except Exception as e:
+        logger.error(f"Error in prestige command: {e}")
+        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
     finally:
         session.close()
 
@@ -224,7 +254,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             await update.message.reply_text(welcome_text)
 
-            # --- YEH HAI SABSE ZAROORI BADLAV ---
             # Har message ke baad 1 second ka intezar karein
             await asyncio.sleep(1) 
 
@@ -269,6 +298,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("🎉 Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
         
         session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error handling message: {e}")
     finally:
         session.close()
 
@@ -332,6 +364,9 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         else:
             await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
+    except Exception as e:
+        logger.error(f"Error in buy command: {e}")
+        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
     finally:
         session.close()
 
@@ -353,6 +388,9 @@ async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db_receiver.reputation += 1
         session.commit()
         await update.message.reply_to_message.reply_text(f"{receiver.first_name} ki reputation {giver.first_name} ne badhai! Current reputation: {db_receiver.reputation} 👍")
+    except Exception as e:
+        logger.error(f"Error in rep command: {e}")
+        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
     finally:
         session.close()
 
@@ -396,6 +434,7 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     # NEW: Start the Flask web server in a separate thread
     flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
     flask_thread.start()
 
     # Create the Telegram bot application
