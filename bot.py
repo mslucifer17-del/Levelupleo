@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# LevelUp Leo Bot - Final Production Code
-# A comprehensive gamification bot for Telegram groups.
+# LevelUp Leo Bot - Final Production Code for Web Service Hosting
+# Includes a Flask web server to keep the service alive on Render.com
 
 import os
 import logging
@@ -18,6 +18,10 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+# NEW: Imports for Flask Web Server
+from flask import Flask
+from threading import Thread
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -83,12 +87,25 @@ except Exception as e:
 # 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
     1: "CAACAgIAAxkBAAENpQZk_0e-vj2QW_Gzob0e-VzO_j7IAgACIQADwZxgDGWWb_TEi5iKLwQ", # Example: Hi
-    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE", # Example: Good
-    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",# Example: Wow
-    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",# Example: Awesome
-    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ", # Example: Pro
-    100: "CAACAgIAAxkBAAECZnxow7pJgs1gCyIwzTGK1Mf7K_Y1IwACChkAAk4fiEks87uCYi_pljYE",# Example: Legend
+    5: "CAACAgIAAxkBAAENpQhk_0fG_d5h2w5A-ag6-yWkH5EAAqsCAAI_wZxgDFG1dseJTTlGLwQ", # Example: Good
+    10: "CAACAgIAAxkBAAENpQpk_0fN-7Y6_gXbAemxO1-4Vxn-qgACLAADwZxgDFED3Q2G39EOLwQ",# Example: Wow
+    25: "CAACAgIAAxkBAAENpQxk_0fYJbA2yV-Ym3v_f2sQ-3G8aQACNQADwZxgDN_p55yMSmUULwQ",# Example: Awesome
+    50: "CAACAgIAAxkBAAENpQ5k_0fhk_pBavg2R7xG8yA0j9BwHAACQAADwZxgDFa22ATyWMymLwQ", # Example: Pro
+    100: "CAACAgIAAxkBAAENpRBk_0fnwO-2w4l8Y97OQ8uX5KMX_QACRAADwZxgDE-bph64O0gWLwQ",# Example: Legend
 }
+
+# NEW: Flask Web Server setup
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    # This route will respond to Render's health checks
+    return "Bot is running!"
+
+def run_flask():
+    # Render provides the PORT environment variable
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 
 # --- Core Bot Logic ---
 
@@ -107,7 +124,7 @@ def get_or_create_user(session, user_data: Update.effective_user) -> User:
         db_user = User(
             user_id=user_data.id,
             username=user_data.username,
-            first_name=user_data.first_name,
+            first_name=user_data.first_name or "User",
         )
         session.add(db_user)
         session.commit()
@@ -201,7 +218,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             session.close()
             
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.id != GROUP_ID: return # Process messages only from the main group
+    if not update.message or not update.message.from_user or update.effective_chat.id != GROUP_ID:
+        return # Process messages only from the main group
 
     session = Session()
     try:
@@ -297,7 +315,7 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Welcome to the VIP club! 🎖️ Aapko ab special perks milenge.")
         
         else:
-            await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekeho.")
+            await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
     finally:
         session.close()
 
@@ -360,6 +378,11 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- Main Application ---
 def main() -> None:
+    # NEW: Start the Flask web server in a separate thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.start()
+
+    # Create the Telegram bot application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add all command handlers
@@ -383,7 +406,7 @@ def main() -> None:
     # Run spotlight every 24 hours
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
-    logger.info("Starting bot...")
+    logger.info("Starting bot polling...")
     application.run_polling()
 
 if __name__ == '__main__':
