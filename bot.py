@@ -86,12 +86,12 @@ except Exception as e:
 
 # 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
-    1: "CAACAgIAAxkBAAENpQZk_0e-vj2QW_Gzob0e-VzO_j7IAgACIQADwZxgDGWWb_TEi5iKLwQ", # Example: Hi
-    5: "CAACAgIAAxkBAAENpQhk_0fG_d5h2w5A-ag6-yWkH5EAAqsCAAI_wZxgDFG1dseJTTlGLwQ", # Example: Good
-    10: "CAACAgIAAxkBAAENpQpk_0fN-7Y6_gXbAemxO1-4Vxn-qgACLAADwZxgDFED3Q2G39EOLwQ",# Example: Wow
-    25: "CAACAgIAAxkBAAENpQxk_0fYJbA2yV-Ym3v_f2sQ-3G8aQACNQADwZxgDN_p55yMSmUULwQ",# Example: Awesome
-    50: "CAACAgIAAxkBAAENpQ5k_0fhk_pBavg2R7xG8yA0j9BwHAACQAADwZxgDFa22ATyWMymLwQ", # Example: Pro
-    100: "CAACAgIAAxkBAAENpRBk_0fnwO-2w4l8Y97OQ8uX5KMX_QACRAADwZxgDE-bph64O0gWLwQ",# Example: Legend
+    1: "CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE", # Example: Hi
+    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE", # Example: Good
+    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",# Example: Wow
+    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",# Example: Awesome
+    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ", # Example: Pro
+    100: "CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA",# Example: Legend
 }
 
 # NEW: Flask Web Server setup
