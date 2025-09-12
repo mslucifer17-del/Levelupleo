@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# LevelUp Leo Bot - Final Production Code for Web Service Hosting
-# Uses a simpler approach to avoid event loop conflicts
-
+# LevelUp Leo Bot - Webhook Version for Render Hosting
 import os
 import logging
 import random
@@ -19,6 +17,7 @@ from telegram.ext import (
 )
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from flask import Flask, request
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -33,6 +32,8 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
 GROUP_ID = int(os.environ.get('GROUP_ID', 0))
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+PORT = int(os.environ.get('PORT', 8080))
 
 if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
     logger.critical("CRITICAL ERROR: BOT_TOKEN, GEMINI_API_KEY, or GROUP_ID is missing!")
@@ -409,8 +410,34 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
+# --- Webhook Setup for Render ---
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "LevelUp Leo Bot is running!"
+
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    """Handle incoming updates from Telegram"""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(), application.bot)
+        await application.process_update(update)
+    return "OK"
+
+async def set_webhook():
+    """Set webhook on startup"""
+    if WEBHOOK_URL:
+        webhook_url = f"{WEBHOOK_URL}/webhook"
+        await application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+    else:
+        logger.warning("WEBHOOK_URL not set, using polling instead")
+
 # --- Main Application ---
 def main() -> None:
+    global application
+    
     # Create the Telegram bot application
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -435,15 +462,25 @@ def main() -> None:
     # Run spotlight every 24 hours
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
-    logger.info("Starting bot polling...")
-    
-    # Simple polling without complex retry logic
-    application.run_polling(
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Use webhooks if WEBHOOK_URL is set, otherwise use polling
+    if WEBHOOK_URL:
+        logger.info("Starting bot with webhooks...")
+        # Set webhook on startup
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(set_webhook())
+        
+        # Start Flask server
+        app.run(host='0.0.0.0', port=PORT, debug=False)
+    else:
+        logger.info("Starting bot polling...")
+        # Simple polling without complex retry logic
+        application.run_polling(
+            poll_interval=1.0,
+            timeout=30,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
 
 if __name__ == '__main__':
     main()
