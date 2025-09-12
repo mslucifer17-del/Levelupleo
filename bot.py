@@ -7,6 +7,7 @@ import os
 import logging
 import random
 import asyncio
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from sqlalchemy import text
 # NEW: Imports for Flask Web Server
 from flask import Flask
 from threading import Thread
+import requests
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -45,7 +47,7 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -127,10 +129,15 @@ def home():
     # This route will respond to Render's health checks
     return "Bot is running!"
 
+@app.route('/health')
+def health():
+    # Additional health check endpoint
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
 def run_flask():
     # Render provides the PORT environment variable
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 # --- Core Bot Logic ---
 
@@ -430,6 +437,15 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
+# Network error handling
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Check if it's a network error
+    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
+        logger.warning("Network error detected, waiting before retrying...")
+        await asyncio.sleep(5)  # Wait before retrying
+
 # --- Main Application ---
 def main() -> None:
     # NEW: Start the Flask web server in a separate thread
@@ -437,8 +453,18 @@ def main() -> None:
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Create the Telegram bot application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Create the Telegram bot application with connection pooling
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .pool_timeout(30)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .build()
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
     
     # Add all command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -462,7 +488,33 @@ def main() -> None:
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
     logger.info("Starting bot polling...")
-    application.run_polling()
+    
+    # Implement retry logic for network issues
+    max_retries = 5
+    retry_delay = 10  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            application.run_polling(
+                poll_interval=1.0,  # Increased poll interval
+                timeout=30,         # Increased timeout
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+            break  # If successful, break out of the loop
+        except Exception as e:
+            if "network" in str(e).lower() or "connection" in str(e).lower():
+                logger.error(f"Network error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries exceeded. Exiting.")
+                    raise
+            else:
+                # Re-raise if it's not a network error
+                raise
 
 if __name__ == '__main__':
     main()
