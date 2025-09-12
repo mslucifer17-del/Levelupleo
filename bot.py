@@ -208,12 +208,19 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for member in update.message.new_chat_members:
         session = Session()
         try:
-            get_or_create_user(session, member) # Add user to DB on join
+            get_or_create_user(session, member) # User ko DB mein add karein
             welcome_text = (
-                f"Hey {member.first_name}, welcome to ThePromotionHub!\n\n"
-                f"Hmm, tumhari level to 0 hai. Message karo aur apni level up karo 💪."
+                f"Hey {member.first_name}, welcome to ThePromotionHub! 🎉\n\n"
+                f"Right now your level is 0. Start messaging and grow your level 🚀."
             )
             await update.message.reply_text(welcome_text)
+
+            # --- YEH HAI SABSE ZAROORI BADLAV ---
+            # Har message ke baad 1 second ka intezar karein
+            await asyncio.sleep(1) 
+
+        except Exception as e:
+            logger.error(f"Welcome message error for {member.id}: {e}")
         finally:
             session.close()
             
