@@ -7,6 +7,7 @@ import os
 import logging
 import random
 import asyncio
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -19,10 +20,6 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-# NEW: Imports for Flask Web Server
-from flask import Flask
-from threading import Thread
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -44,7 +41,7 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -111,11 +108,17 @@ except Exception as e:
 # 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
     1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"], # Multiple stickers for level 1
-    5: ["CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE"],
-    10: ["CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ"],
-    25: ["CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE"],
-    50: ["CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ"],
-    100: ["CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA"]
+    2: ["CAACAgEAAxkBAAECaP1oxRfMvKFVsuGdqgFtWL8LoqKjMQACBQMAAnNOIERFC6_h0W0SgDYE"],
+    4: ["CAACAgEAAxkBAAECaQFoxRf1T3qdVXZN623-6KUJarP_hQACfQMAAj7OWETdjsszH42-rzYE"],
+    10: ["CAACAgIAAxkBAAECaQVoxRgnf9Tl_egizv2IzRq-p4JDPgACWDEAAvTKMEpYpE1ML4rwgTYE"],
+    15: ["CgACAgQAAxkBAAECaQdoxRidErmqz3qB1miEt6Bf38ty2QACVwMAAolPBFMwDn_gBXkQejYE"],
+    20: ["CAACAgUAAxkBAAECaQ9oxRkWl7-xcGPLi-lwXgABsioAAbKwAAIzDgAC5j65V5cS4rkdBo1VNgQ"]
+    30: ["CAACAgIAAxkBAAECaRVoxRnUU7Q1SqXKZmqOZWSuAAHeGBMAAuENAAIxDJhKsojdm6OviV42BA"], # Multiple stickers for level 1
+    40: ["CAACAgIAAxkBAAECaRdoxRoGN8TzhAkHosNsA2gmOx5rAgACjwYAAtJaiAEE4A-WIoMiBTYE"],
+    50: ["CAACAgIAAxkBAAECaRloxRosJz8PPM_sXS5tYWkrERl1hgACEQEAAiteUwtIyKiZ9C1kczYE"],
+    60: ["CAACAgEAAxkBAAECaR1oxRqgy5loi2Bn9H73XIDtgxS5DgACWQoAAr-MkARSHfGoioZ2dDYE"],
+    70: ["CAACAgIAAxkBAAECaR9oxRsy5ik6Lafehl768jrOYUAgxgACMAADWbv8Jb2cViz8YDqINgQ"],
+    100: ["CgACAgQAAxkBAAECaSNoxRyHpjl-ewc5MSsrH1KN5fGleQACXQcAApuxnVCKrIelHCgSAzYE"]
 }
 
 # Add more stickers for each level
@@ -125,35 +128,23 @@ for level in [2, 3, 4, 6, 7, 8, 9, 15, 20, 30, 40, 60, 70, 80, 90]:
 
 # 6. Random level-up messages
 LEVEL_UP_MESSAGES = [
-    "🎉 Badhai ho {name}! Aap level {level} par pahunch gaye! 🎉",
-    "🚀 Wah {name}! Aapne level {level} achieve kar liya! 🚀",
-    "🔥 Shandaar {name}! Level {level} complete! 🔥",
+    "🎉 Congratulations {name}, you have successfully reached Level {level}! 🎉",
+    "🚀 Well done {name}, you have achieved Level {level}! 🚀",
+    "🔥 Excellent work {name}, you have completed Level {level}! 🔥",
     "🌟 {name} ne level {level} haasil kiya! Party time! 🌟",
-    "💫 Kamaal kar diya {name}! Level {level} unlocked! 💫",
-    "🏆 Jeet gaye {name}! Level {level} conquered! 🏆",
-    "🎊 Mubarak ho {name}! Aap level {level} par hain! 🎊",
-    "⚡ Zabardast {name}! Level {level} achieved! ⚡",
-    "👑 Badshah {name} ne level {level} jeeta! 👑",
-    "💎 Heera {name} level {level} par chamak gaya! 💎",
-    "🌈 Rangeen jeet {name} ki! Level {level} complete! 🌈",
-    "🎯 Seedha nishana {name}! Level {level} achieved! 🎯",
-    "🚀 Rocket {name} level {level} par pahunch gaya! 🚀",
-    "🏅 Champion {name} ne level {level} jeeta! 🏅",
-    "✨ Chamakta sitara {name} level {level} par! ✨"
+    "🌟 {name}, you have reached Level {level}. Time to celebrate! 🌟",
+    "💫 Impressive {name}, you have unlocked Level {level}! 💫",
+    "🏆 Congratulations {name}, you have conquered Level {level}! 🏆",
+    "🎊 Well done {name}, you are now on Level {level}! 🎊",
+    "⚡ Fantastic effort {name}, you have achieved Level {level}! ⚡",
+    "👑 {name}, you have triumphed at Level {level}! 👑",
+    "💎 Brilliant {name}, you shine at Level {level}! 💎",
+    "🌈 Outstanding success {name}, you have completed Level {level}! 🌈",
+    "🎯 Right on target {name}, you have achieved Level {level}! 🎯",
+    "🚀 Swift progress {name}, you’ve reached Level {level}! 🚀",
+    "🏅 Champion move {name}, you have won Level {level}! 🏅"
+    "✨ Congratulations {name}, you are now a shining star at Level {level}! ✨"
 ]
-
-# NEW: Flask Web Server setup
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    # This route will respond to Render's health checks
-    return "Bot is running!"
-
-def run_flask():
-    # Render provides the PORT environment variable
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # --- Core Bot Logic ---
 
@@ -456,15 +447,29 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
+# Network error handling
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Check if it's a network error
+    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
+        logger.warning("Network error detected, waiting before retrying...")
+        await asyncio.sleep(5)  # Wait before retrying
+
 # --- Main Application ---
 def main() -> None:
-    # NEW: Start the Flask web server in a separate thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Create the Telegram bot application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Create the Telegram bot application with connection pooling
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .pool_timeout(30)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .build()
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
     
     # Add all command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -488,7 +493,33 @@ def main() -> None:
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
     logger.info("Starting bot polling...")
-    application.run_polling()
+    
+    # Implement retry logic for network issues
+    max_retries = 5
+    retry_delay = 10  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            application.run_polling(
+                poll_interval=1.0,  # Increased poll interval
+                timeout=30,         # Increased timeout
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+            break  # If successful, break out of the loop
+        except Exception as e:
+            if "network" in str(e).lower() or "connection" in str(e).lower():
+                logger.error(f"Network error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries exceeded. Exiting.")
+                    raise
+            else:
+                # Re-raise if it's not a network error
+                raise
 
 if __name__ == '__main__':
     main()
