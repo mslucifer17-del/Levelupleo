@@ -7,25 +7,22 @@ import os
 import logging
 import random
 import asyncio
-import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import google.generativeai as genai
-from telegram import Update, Sticker, ChatMember, Chat
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, 
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import text
 
 # NEW: Imports for Flask Web Server
 from flask import Flask
 from threading import Thread
-import requests
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -47,7 +44,7 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
+engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -113,13 +110,37 @@ except Exception as e:
 
 # 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
-    1: "CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE", # Example: Hi
-    5: "CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE", # Example: Good
-    10: "CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ",# Example: Wow
-    25: "CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE",# Example: Awesome
-    50: "CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ", # Example: Pro
-    100: "CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA",# Example: Legend
+    1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"], # Multiple stickers for level 1
+    5: ["CAACAgIAAxkBAAECZnJow7hdgpqcTIT0DOLHNPGnzGRkKAAC2gcAAkb7rAQzJBAGerWb9DYE"],
+    10: ["CAACAgIAAxkBAAECZnZow7kwKCGQatfYcbleyHa3PXnwTwAC_wADVp29Ctqt-n3kvEAkNgQ"],
+    25: ["CAACAgEAAxkBAAECZnhow7mGUl7Z1snxJyRNWP5037ziowACNwIAAh8GKEfvyfXEdjV49DYE"],
+    50: ["CAACAgIAAxkBAAECZnpow7nEKLWwj_mqpOfukS5QgeEJRAACjQAD9wLIDySOeTFwpasYNgQ"],
+    100: ["CAACAgIAAxkBAAECZoZow8lb7GLHDtfqCdG5JFkAAb3tRq0AAvYSAAIp_UhJZrzas7gxByo2BA"]
 }
+
+# Add more stickers for each level
+for level in [2, 3, 4, 6, 7, 8, 9, 15, 20, 30, 40, 60, 70, 80, 90]:
+    if level not in LEVEL_STICKERS:
+        LEVEL_STICKERS[level] = ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"]
+
+# 6. Random level-up messages
+LEVEL_UP_MESSAGES = [
+    "🎉 Badhai ho {name}! Aap level {level} par pahunch gaye! 🎉",
+    "🚀 Wah {name}! Aapne level {level} achieve kar liya! 🚀",
+    "🔥 Shandaar {name}! Level {level} complete! 🔥",
+    "🌟 {name} ne level {level} haasil kiya! Party time! 🌟",
+    "💫 Kamaal kar diya {name}! Level {level} unlocked! 💫",
+    "🏆 Jeet gaye {name}! Level {level} conquered! 🏆",
+    "🎊 Mubarak ho {name}! Aap level {level} par hain! 🎊",
+    "⚡ Zabardast {name}! Level {level} achieved! ⚡",
+    "👑 Badshah {name} ne level {level} jeeta! 👑",
+    "💎 Heera {name} level {level} par chamak gaya! 💎",
+    "🌈 Rangeen jeet {name} ki! Level {level} complete! 🌈",
+    "🎯 Seedha nishana {name}! Level {level} achieved! 🎯",
+    "🚀 Rocket {name} level {level} par pahunch gaya! 🚀",
+    "🏅 Champion {name} ne level {level} jeeta! 🏅",
+    "✨ Chamakta sitara {name} level {level} par! ✨"
+]
 
 # NEW: Flask Web Server setup
 app = Flask(__name__)
@@ -129,15 +150,10 @@ def home():
     # This route will respond to Render's health checks
     return "Bot is running!"
 
-@app.route('/health')
-def health():
-    # Additional health check endpoint
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
 def run_flask():
     # Render provides the PORT environment variable
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # --- Core Bot Logic ---
 
@@ -149,7 +165,7 @@ def get_level_requirements(level: int) -> int:
     elif level <= 50: return 475 + (level - 25) * 50
     else: return 1725 + (level - 50) * 100
 
-def get_or_create_user(session, user_data: Update.effective_user) -> User:
+def get_or_create_user(session, user_data) -> User:
     """Gets a user from the DB or creates a new one."""
     db_user = session.query(User).filter(User.user_id == user_data.id).first()
     if not db_user:
@@ -171,17 +187,19 @@ def get_or_create_user(session, user_data: Update.effective_user) -> User:
     return db_user
 
 async def generate_level_up_message(level: int, username: str) -> str:
-    """Generates a unique level-up message using Gemini AI."""
-    if not gemini_model:
-        return f"Woooah {username}! Aap Level {level} par pahunch gaye! Keep it up! 🔥"
-        
-    prompt = f"Write a very short, cool, and motivating message in Hinglish for a user named '{username}' who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
-    try:
-        response = await gemini_model.generate_content_async(prompt, safety_settings={'HARASSMENT':'block_none'})
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-        return f"Woooah {username}! Aap Level {level} par pahunch gaye! Keep it up! 🔥"
+    """Generates a unique level-up message using Gemini AI or random messages."""
+    # Use Gemini if available
+    if gemini_model:
+        prompt = f"Write a very short, cool, and motivating message in Hinglish for a user named '{username}' who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
+        try:
+            response = await gemini_model.generate_content_async(prompt, safety_settings={'HARASSMENT':'block_none'})
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Gemini Error: {e}")
+    
+    # Fallback to random messages if Gemini fails or is not available
+    message_template = random.choice(LEVEL_UP_MESSAGES)
+    return message_template.format(name=username, level=level)
 
 # 2. Command Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -292,13 +310,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             db_user.level = new_level
             db_user.hubcoins += new_level * 10 # Bonus coins on level up
             
-            # Send Gemini message
+            # Send random level-up message
             level_up_text = await generate_level_up_message(new_level, db_user.first_name)
             await update.message.reply_text(level_up_text)
             
-            # Send Sticker
-            if new_level in LEVEL_STICKERS:
-                await update.message.reply_sticker(LEVEL_STICKERS[new_level])
+            # Send random sticker for this level
+            if new_level in LEVEL_STICKERS and LEVEL_STICKERS[new_level]:
+                random_sticker = random.choice(LEVEL_STICKERS[new_level])
+                await update.message.reply_sticker(random_sticker)
             
             # Prestige Prompt at Level 100
             if new_level == 100:
@@ -437,15 +456,6 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
     finally:
         session.close()
 
-# Network error handling
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling an update: {context.error}")
-    
-    # Check if it's a network error
-    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
-        logger.warning("Network error detected, waiting before retrying...")
-        await asyncio.sleep(5)  # Wait before retrying
-
 # --- Main Application ---
 def main() -> None:
     # NEW: Start the Flask web server in a separate thread
@@ -453,18 +463,8 @@ def main() -> None:
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Create the Telegram bot application with connection pooling
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .pool_timeout(30)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
+    # Create the Telegram bot application
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add all command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -488,33 +488,7 @@ def main() -> None:
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
     logger.info("Starting bot polling...")
-    
-    # Implement retry logic for network issues
-    max_retries = 5
-    retry_delay = 10  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            application.run_polling(
-                poll_interval=1.0,  # Increased poll interval
-                timeout=30,         # Increased timeout
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
-            break  # If successful, break out of the loop
-        except Exception as e:
-            if "network" in str(e).lower() or "connection" in str(e).lower():
-                logger.error(f"Network error on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.error("Max retries exceeded. Exiting.")
-                    raise
-            else:
-                # Re-raise if it's not a network error
-                raise
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
