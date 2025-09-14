@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 
 # LevelUp Leo Bot - Final Production Code for Web Service Hosting
-# Includes a Flask web server to keep the service alive on Render.com
+# Includes auto-delete feature for messages after 1 minute
 
 import os
 import logging
 import random
 import asyncio
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -17,12 +19,9 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-# NEW: Imports for Flask Web Server
-from flask import Flask
-from threading import Thread
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -44,7 +43,7 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -124,43 +123,45 @@ LEVEL_STICKERS = {
     100: ["CgACAgQAAxkBAAECaSNoxRyHpjl-ewc5MSsrH1KN5fGleQACXQcAApuxnVCKrIelHCgSAzYE"]
 }
 
-# Add more stickers for each level
-for level in [2, 3, 4, 6, 7, 8, 9, 15, 20, 30, 40, 60, 70, 80, 90]:
-    if level not in LEVEL_STICKERS:
-        LEVEL_STICKERS[level] = ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"]
-
-# 6. Random level-up messages
+# 6. Random level-up messages with user mentions
 LEVEL_UP_MESSAGES = [
-    "🎉 Congratulations {name}, you have successfully reached Level {level}! 🎉",
-    "🚀 Well done {name}, you have achieved Level {level}! 🚀",
-    "🔥 Excellent work {name}, you have completed Level {level}! 🔥",
-    "🌟 {name} ne level {level} haasil kiya! Party time! 🌟",
-    "🌟 {name}, you have reached Level {level}. Time to celebrate! 🌟",
-    "💫 Impressive {name}, you have unlocked Level {level}! 💫",
-    "🏆 Congratulations {name}, you have conquered Level {level}! 🏆",
-    "🎊 Well done {name}, you are now on Level {level}! 🎊",
-    "⚡ Fantastic effort {name}, you have achieved Level {level}! ⚡",
-    "👑 {name}, you have triumphed at Level {level}! 👑",
-    "💎 Brilliant {name}, you shine at Level {level}! 💎",
-    "🌈 Outstanding success {name}, you have completed Level {level}! 🌈",
-    "🎯 Right on target {name}, you have achieved Level {level}! 🎯",
-    "🚀 Swift progress {name}, you’ve reached Level {level}! 🚀",
-    "🏅 Champion move {name}, you have won Level {level}! 🏅"
-    "✨ Congratulations {name}, you are now a shining star at Level {level}! ✨"
+    "🎉 Congrats {}! you’ve leveled up to {level}! 🎉",
+    "🚀 Nice work {}! you just hit Level {level}! 🚀",
+    "🔥 Way to go {}! Level {level} unlocked! 🔥",
+    "🌟 Big win {}! you’ve reached Level {level}! 🌟",
+    "💫 Impressive {}! Level {level} achieved! 💫",
+    "🏆 Champion vibes {}! Level {level} conquered! 🏆",
+    "🎊 Cheers {}! you’re officially on Level {level}! 🎊",
+    "⚡ Energy unmatched {}! Level {level} unlocked! ⚡",
+    "👑 King/Queen move {}! you’ve claimed Level {level}! 👑",
+    "💎 Brilliant {}! you’re shining at Level {level}! 💎",
+    "🌈 Amazing {}! Level {level} completed! 🌈",
+    "🎯 Spot on {}! you nailed Level {level}! 🎯",
+    "🚀 Fast climb {}! Level {level} unlocked! 🚀",
+    "🏅 Gold star {}! you’ve achieved Level {level}! 🏅",
+    "✨ Sparkling success {}! Level {level} reached! ✨"
 ]
 
-# NEW: Flask Web Server setup
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    # This route will respond to Render's health checks
-    return "Bot is running!"
-
-def run_flask():
-    # Render provides the PORT environment variable
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+# --- Auto-Delete Functionality ---
+def delete_message_after_delay(bot, chat_id, message_id, delay=60):
+    """Delete a message after a specified delay"""
+    def delete_task():
+        time.sleep(delay)
+        try:
+            bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(f"Message {message_id} deleted after {delay} seconds")
+        except BadRequest as e:
+            if "Message to delete not found" in str(e):
+                logger.warning(f"Message {message_id} already deleted")
+            else:
+                logger.error(f"Error deleting message {message_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error deleting message {message_id}: {e}")
+    
+    # Start deletion in a separate thread
+    thread = threading.Thread(target=delete_task)
+    thread.daemon = True
+    thread.start()
 
 # --- Core Bot Logic ---
 
@@ -193,24 +194,25 @@ def get_or_create_user(session, user_data) -> User:
                 raise e
     return db_user
 
-async def generate_level_up_message(level: int, username: str) -> str:
+async def generate_level_up_message(level: int, user_mention: str) -> str:
     """Generates a unique level-up message using Gemini AI or random messages."""
     # Use Gemini if available
     if gemini_model:
-        prompt = f"Write a very short, cool, and motivating message in Hinglish for a user named '{username}' who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
+        prompt = f"Write a very short, cool, and motivating message in Hinglish for a user who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
         try:
             response = await gemini_model.generate_content_async(prompt, safety_settings={'HARASSMENT':'block_none'})
-            return response.text.strip()
+            return f"{user_mention} {response.text.strip()}"
         except Exception as e:
             logger.error(f"Gemini Error: {e}")
     
     # Fallback to random messages if Gemini fails or is not available
     message_template = random.choice(LEVEL_UP_MESSAGES)
-    return message_template.format(name=username, level=level)
+    return message_template.format(user_mention, level)
 
 # 2. Command Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao! /help se saare commands dekho.")
+    msg = await update.message.reply_text("Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao! /help se saare commands dekho.")
+    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
@@ -222,7 +224,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "`/prestige` - Level 100 ke baad special badge ke liye level reset karo.\n"
         "Reply to a message with `/rep` to give reputation to a user."
     )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    msg = await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = Session()
@@ -241,10 +244,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"• **Next Level:** in {messages_for_next} messages.\n"
             f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}"
         )
-        await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+        msg = await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     except Exception as e:
         logger.error(f"Error in stats command: {e}")
-        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     finally:
         session.close()
 
@@ -253,7 +258,8 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         db_user = get_or_create_user(session, update.effective_user)
         if db_user.level < 100:
-            await update.message.reply_text("Prestige ke liye Level 100 tak pahunchna zaroori hai!")
+            msg = await update.message.reply_text("Prestige ke liye Level 100 tak pahunchna zaroori hai!")
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
             return
 
         db_user.prestige += 1
@@ -262,15 +268,18 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db_user.hubcoins += 500 * db_user.prestige # More coins for higher prestige
         session.commit()
 
+        user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
         prestige_badge = '🌟' * db_user.prestige
-        await update.message.reply_text(
-            f"🎊 CONGRATULATIONS, {db_user.first_name}! 🎊\n\n"
+        msg = await update.message.reply_text(
+            f"🎊 CONGRATULATIONS, {user_mention}! 🎊\n\n"
             f"Aapne Prestige {db_user.prestige} haasil kar liya hai! {prestige_badge}\n"
             f"Aapki level reset ho gayi hai, aur aapko {500 * db_user.prestige} HubCoins ka bonus mila hai. Keep rocking!"
         )
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     except Exception as e:
         logger.error(f"Error in prestige command: {e}")
-        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     finally:
         session.close()
 
@@ -280,11 +289,50 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session = Session()
         try:
             get_or_create_user(session, member) # User ko DB mein add karein
-            welcome_text = (
-                f"Hey {member.first_name}, welcome to ThePromotionHub! 🎉\n\n"
-                f"Right now your level is 0. Start messaging and grow your level 🚀."
-            )
-            await update.message.reply_text(welcome_text)
+            
+            # Use username if available, otherwise first name
+            user_mention = f"@{member.username}" if member.username else member.first_name
+            
+            # Gen-Z style welcome messages with different fonts and emojis
+            welcome_messages = [
+                f"✨ 𝗪𝗲𝗹𝗰𝗺 {user_mention}  ✨\n\n"
+                f"🎯 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗧𝗵𝗲𝗣𝗿𝗼𝗺𝗼𝘁𝗶𝗼𝗻𝗛𝘂𝗯  🎯\n\n"
+                f"🌟 𝗬𝗼𝘂𝗿 𝗷𝗼𝘂𝗿𝗻𝗲𝘆 𝗯𝗲𝗴𝗶𝗻𝘀 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬  🌟\n"
+                f"💬 𝗗𝗿𝗼𝗽 𝗺𝗲𝘀𝘀𝗮𝗴𝗲𝘀, 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽 & 𝗲𝗮𝗿𝗻 𝗿𝗲𝘄𝗮𝗿𝗱𝘀  💬",
+                
+                f"🔥 𝗪𝗲𝗹𝗰𝗼𝗺𝗲 {user_mention}  🔥\n\n"
+                f"🎊 𝗧𝗵𝗮𝗻𝗸𝘀 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝘁𝗵𝗲 𝗳𝗮𝗺  🎊\n\n"
+                f"🚀 𝗖𝘂𝗿𝗿𝗲𝗻𝘁 𝗹𝗲𝘃𝗲𝗹: 𝟬  🚀\n"
+                f"💎 𝗦𝘁𝗮𝗿𝘁 𝗰𝗵𝗮𝘁𝘁𝗶𝗻𝗴 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  💎",
+                
+                f"💫 𝗪𝗲𝗹𝗰𝗺 {user_mention}  💫\n\n"
+                f"🌸 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗼𝘂𝗿 𝗰𝗼𝗺𝗺𝘂𝗻𝗶𝘁𝘆  🌸\n\n"
+                f"📈 𝗬𝗼𝘂'𝗿𝗲 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬 𝗻𝗼𝘄  📈\n"
+                f"🎯 𝗦𝗲𝗻𝗱 𝗺𝗲𝘀𝘀𝗮𝗴𝗲𝘀 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  🎯",
+                
+                f"🎉 𝗪𝗲𝗹𝗰𝗼𝗺𝗲 {user_mention}  🎉\n\n"
+                f"💖 𝗧𝗵𝗮𝗻𝗸𝘀 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗧𝗵𝗲𝗣𝗿𝗼𝗺𝗼𝘁𝗶𝗼𝗻𝗛𝘂𝗯  💖\n\n"
+                f"✨ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴 𝗹𝗲𝘃𝗲𝗹: 𝟬  ✨\n"
+                f"🔥 𝗖𝗵𝗮𝘁 𝘁𝗼 𝗶𝗻𝗰𝗿𝗲𝗮𝘀𝗲 𝘆𝗼𝘂𝗿 𝗹𝗲𝘃𝗲𝗹  🔥",
+                
+                f"🌟 𝗪𝗲𝗹𝗰𝗺 {user_mention}  🌟\n\n"
+                f"🎁 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝘁𝗵𝗲 𝗵𝘂𝗯  🎁\n\n"
+                f"🚀 𝗬𝗼𝘂'𝗿𝗲 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬  🚀\n"
+                f"💎 𝗦𝘁𝗮𝗿𝘁 𝗺𝗲𝘀𝘀𝗮𝗴𝗶𝗻𝗴 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  💎"
+            ]
+            
+            # Random emoji combinations to add at the end
+            emoji_combinations = [
+                "✨🔥💫🌟🎯",
+                "🚀💎🎊🌸💖",
+                "🎉🔥🌟💫✨",
+                "💎🚀🎯💖🌸",
+                "✨🎊🔥💎🌟"
+            ]
+            
+            welcome_text = random.choice(welcome_messages) + "\n\n" + random.choice(emoji_combinations)
+            msg = await update.message.reply_text(welcome_text)
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id, 120)  # Delete after 2 minutes
 
             # Har message ke baad 1 second ka intezar karein
             await asyncio.sleep(1) 
@@ -317,18 +365,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             db_user.level = new_level
             db_user.hubcoins += new_level * 10 # Bonus coins on level up
             
+            # Create user mention
+            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+            
             # Send random level-up message
-            level_up_text = await generate_level_up_message(new_level, db_user.first_name)
-            await update.message.reply_text(level_up_text)
+            level_up_text = await generate_level_up_message(new_level, user_mention)
+            level_up_msg = await update.message.reply_text(level_up_text)
+            delete_message_after_delay(context.bot, update.effective_chat.id, level_up_msg.message_id)
             
             # Send random sticker for this level
             if new_level in LEVEL_STICKERS and LEVEL_STICKERS[new_level]:
-                random_sticker = random.choice(LEVEL_STICKERS[new_level])
-                await update.message.reply_sticker(random_sticker)
+                sticker_msg = await update.message.reply_sticker(random.choice(LEVEL_STICKERS[new_level]))
+                delete_message_after_delay(context.bot, update.effective_chat.id, sticker_msg.message_id)
             
             # Prestige Prompt at Level 100
             if new_level == 100:
-                await update.message.reply_text("🎉 Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
+                prestige_msg = await update.message.reply_text(f"🎉 {user_mention} Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
+                delete_message_after_delay(context.bot, update.effective_chat.id, prestige_msg.message_id)
+        
+        # Delete the original user message after 1 minute
+        delete_message_after_delay(context.bot, update.effective_chat.id, update.message.message_id)
         
         session.commit()
     except Exception as e:
@@ -349,12 +405,14 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "3. **VIP** (10000 Coins) - Permanent VIP status aur special perks.\n"
         "   `/buy vip`"
     )
-    await update.message.reply_text(shop_text, parse_mode=ParseMode.MARKDOWN)
+    msg = await update.message.reply_text(shop_text, parse_mode=ParseMode.MARKDOWN)
+    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
-        await update.message.reply_text("Kya khareedna hai? Example: `/buy title My Awesome Title`")
+        msg = await update.message.reply_text("Kya khareedna hai? Example: `/buy title My Awesome Title`")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
         return
 
     item = args[0].lower()
@@ -365,54 +423,68 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if item == "title":
             title_text = " ".join(args[1:])
             if not title_text:
-                await update.message.reply_text("Title likhna zaroori hai. Example: `/buy title The King`")
+                msg = await update.message.reply_text("Title likhna zaroori hai. Example: `/buy title The King`")
+                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
                 return
             if db_user.hubcoins < 1000:
-                await update.message.reply_text(f"Iske liye 1000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                msg = await update.message.reply_text(f"Iske liye 1000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
                 return
             
             db_user.hubcoins -= 1000
             db_user.custom_title = title_text[:20] # Max 20 chars
             db_user.custom_title_expiry = datetime.now() + timedelta(days=7)
             session.commit()
-            await update.message.reply_text(f"Badhai ho! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
+            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+            msg = await update.message.reply_text(f"Badhai ho {user_mention}! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
 
         elif item == "spotlight":
             if db_user.hubcoins < 2500:
-                await update.message.reply_text(f"Iske liye 2500 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                msg = await update.message.reply_text(f"Iske liye 2500 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
                 return
             db_user.hubcoins -= 2500
             db_user.spotlight_priority = True
             session.commit()
-            await update.message.reply_text("Kharidari safal! Aapko agle spotlight mein priority di jayegi. 🌟")
+            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+            msg = await update.message.reply_text(f"Kharidari safal {user_mention}! Aapko agle spotlight mein priority di jayegi. 🌟")
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
             
         elif item == "vip":
             if db_user.hubcoins < 10000:
-                await update.message.reply_text(f"Iske liye 10000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                msg = await update.message.reply_text(f"Iske liye 10000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
+                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
                 return
             db_user.hubcoins -= 10000
             db_user.vip_member = True
             session.commit()
-            await update.message.reply_text("Welcome to the VIP club! 🎖️ Aapko ab special perks milenge.")
+            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+            msg = await update.message.reply_text(f"Welcome to the VIP club {user_mention}! 🎖️ Aapko ab special perks milenge.")
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
         
         else:
-            await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
+            msg = await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
+            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     except Exception as e:
         logger.error(f"Error in buy command: {e}")
-        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     finally:
         session.close()
 
 async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message.reply_to_message:
-        await update.message.reply_text("Yeh command kisi message ko reply karke istemal karein.")
+        msg = await update.message.reply_text("Yeh command kisi message ko reply karke istemal karein.")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
         return
         
     giver = update.effective_user
     receiver = update.message.reply_to_message.from_user
     
     if giver.id == receiver.id:
-        await update.message.reply_text("Aap khud ko reputation nahi de sakte!")
+        msg = await update.message.reply_text("Aap khud ko reputation nahi de sakte!")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
         return
         
     session = Session()
@@ -420,10 +492,14 @@ async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db_receiver = get_or_create_user(session, receiver)
         db_receiver.reputation += 1
         session.commit()
-        await update.message.reply_to_message.reply_text(f"{receiver.first_name} ki reputation {giver.first_name} ne badhai! Current reputation: {db_receiver.reputation} 👍")
+        giver_mention = f"@{giver.username}" if giver.username else giver.first_name
+        receiver_mention = f"@{receiver.username}" if receiver.username else receiver.first_name
+        msg = await update.message.reply_to_message.reply_text(f"{receiver_mention} ki reputation {giver_mention} ne badhai! Current reputation: {db_receiver.reputation} 👍")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     except Exception as e:
         logger.error(f"Error in rep command: {e}")
-        await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
+        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
     finally:
         session.close()
 
@@ -449,29 +525,45 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
             selected_user = random.choice(active_users)
             logger.info(f"Spotlight random user found: {selected_user.first_name}")
         
+        user_mention = f"@{selected_user.username}" if selected_user.username else selected_user.first_name
         spotlight_text = (
-            f"🌟 **Aaj ke Spotlight Member hain {selected_user.get_display_name()}!** 🌟\n\n"
+            f"🌟 **Aaj ke Spotlight Member hain {user_mention}!** 🌟\n\n"
             f"Yeh hamare group ke ek bahut active sadasya hain (Level: {selected_user.level}).\n\n"
             f"Chaliye, aaj hum sab milkar inko support karte hain! "
             f"Inke content ko check karein aur feedback dein!"
         )
         
-        await context.bot.send_message(chat_id=GROUP_ID, text=spotlight_text, parse_mode=ParseMode.MARKDOWN)
+        msg = await context.bot.send_message(chat_id=GROUP_ID, text=spotlight_text, parse_mode=ParseMode.MARKDOWN)
+        delete_message_after_delay(context.bot, GROUP_ID, msg.message_id, 3600)  # Delete after 1 hour
         session.commit()
     except Exception as e:
         logger.error(f"Spotlight Error: {e}")
     finally:
         session.close()
 
+# Network error handling
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Check if it's a network error
+    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
+        logger.warning("Network error detected, waiting before retrying...")
+        await asyncio.sleep(5)  # Wait before retrying
+
 # --- Main Application ---
 def main() -> None:
-    # NEW: Start the Flask web server in a separate thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Create the Telegram bot application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Create the Telegram bot application with connection pooling
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .pool_timeout(30)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .build()
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
     
     # Add all command handlers
     application.add_handler(CommandHandler("start", start_command))
@@ -495,7 +587,33 @@ def main() -> None:
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
 
     logger.info("Starting bot polling...")
-    application.run_polling()
+    
+    # Implement retry logic for network issues
+    max_retries = 5
+    retry_delay = 10  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            application.run_polling(
+                poll_interval=1.0,  # Increased poll interval
+                timeout=30,         # Increased timeout
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+            break  # If successful, break out of the loop
+        except Exception as e:
+            if "network" in str(e).lower() or "connection" in str(e).lower():
+                logger.error(f"Network error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error("Max retries exceeded. Exiting.")
+                    raise
+            else:
+                # Re-raise if it's not a network error
+                raise
 
 if __name__ == '__main__':
     main()
