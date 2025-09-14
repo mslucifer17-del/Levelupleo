@@ -7,3 +7,4 @@ Flask
 aiohttp>=3.12.15
 asyncpg
 redis
+asyncio
