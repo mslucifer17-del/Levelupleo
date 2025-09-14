@@ -934,6 +934,23 @@ if __name__ == "__main__":
         asyncio.create_task(start_web_server())
 
         # Telegram bot ko chalana
-        await application.run_polling()
+        await application.run_polling()  # <-- yaha application upar define hoga
+
+    # application ko global define karna zaruri hai
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("prestige", prestige_command))
+    application.add_handler(CommandHandler("shop", shop_command))
+    application.add_handler(CommandHandler("buy", buy_command))
+    application.add_handler(CommandHandler("coins", stats_command)) # /coins will also show stats
+    application.add_handler(CommandHandler("rep", rep_command))
+    application.add_handler(CommandHandler("daily", daily_command))
+
+    # yaha sari handlers add karo (jitne bhi aapne pehle likhe the)
+    # example:
+    # application.add_handler(CommandHandler("start", start))
+    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     asyncio.run(main())
