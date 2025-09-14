@@ -926,7 +926,14 @@ def main() -> None:
         allowed_updates=Update.ALL_TYPES
     )
 
-if __name__ == '__main__':
-    # Start web server for health checks in a separate task
-    asyncio.create_task(start_web_server())
-    main()
+if __name__ == "__main__":
+    import asyncio
+
+    async def main():
+        # Web server ko background me chalana
+        asyncio.create_task(start_web_server())
+
+        # Telegram bot ko chalana
+        await application.run_polling()
+
+    asyncio.run(main())
