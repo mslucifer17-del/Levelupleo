@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# LevelUp Leo Bot - Final Production Code for Web Service Hosting
+# LevelUp Leo Bot - Enhanced Production Code for Web Service Hosting
 # Includes auto-delete feature for messages after 1 minute
 
 import os
@@ -19,9 +19,10 @@ from telegram.ext import (
     ChatMemberHandler, filters
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 
 # --- Configuration ---
 # 1. Logging Setup
@@ -36,6 +37,7 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
 GROUP_ID = int(os.environ.get('GROUP_ID', 0))
+PORT = int(os.environ.get('PORT', 8443))  # For web server
 
 if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
     logger.critical("CRITICAL ERROR: BOT_TOKEN, GEMINI_API_KEY, or GROUP_ID is missing!")
@@ -43,7 +45,37 @@ if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
 
 # 3. Database Setup (SQLAlchemy)
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, pool_timeout=30, pool_recycle=1800)
+
+# Database connection with retry logic
+def create_db_engine():
+    max_retries = 5
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            engine = create_engine(
+                DATABASE_URL, 
+                pool_size=10, 
+                max_overflow=20, 
+                pool_timeout=30, 
+                pool_recycle=1800,
+                connect_args={'connect_timeout': 30} if DATABASE_URL.startswith('postgresql') else {}
+            )
+            # Test connection
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            logger.info("Database connection established successfully")
+            return engine
+        except SQLAlchemyError as e:
+            logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.critical("Max database connection retries exceeded. Exiting.")
+                raise
+
+engine = create_db_engine()
 Session = sessionmaker(bind=engine)
 
 class User(Base):
@@ -94,28 +126,32 @@ def check_and_alter_table():
         logger.error(f"Error checking/altering table: {e}")
 
 # Create tables and check column types
-Base.metadata.create_all(engine)
-# Check if we need to alter the user_id column for PostgreSQL
-if DATABASE_URL.startswith('postgresql'):
-    check_and_alter_table()
+try:
+    Base.metadata.create_all(engine)
+    # Check if we need to alter the user_id column for PostgreSQL
+    if DATABASE_URL.startswith('postgresql'):
+        check_and_alter_table()
+except Exception as e:
+    logger.error(f"Error creating database tables: {e}")
 
 # 4. Gemini AI Initialization
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-pro')
+    logger.info("Gemini AI configured successfully")
 except Exception as e:
     logger.error(f"Failed to configure Gemini AI: {e}")
     gemini_model = None
 
 # 5. Sticker IDs (IMPORTANT: Replace these with your actual sticker file_ids)
 LEVEL_STICKERS = {
-    1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"], # Multiple stickers for level 1
+    1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"],
     2: ["CAACAgEAAxkBAAECaP1oxRfMvKFVsuGdqgFtWL8LoqKjMQACBQMAAnNOIERFC6_h0W0SgDYE"],
     4: ["CAACAgEAAxkBAAECaQFoxRf1T3qdVXZN623-6KUJarP_hQACfQMAAj7OWETdjsszH42-rzYE"],
     10: ["CAACAgIAAxkBAAECaQVoxRgnf9Tl_egizv2IzRq-p4JDPgACWDEAAvTKMEpYpE1ML4rwgTYE"],
     15: ["CgACAgQAAxkBAAECaQdoxRidErmqz3qB1miEt6Bf38ty2QACVwMAAolPBFMwDn_gBXkQejYE"],
     20: ["CAACAgUAAxkBAAECaQ9oxRkWl7-xcGPLi-lwXgABsioAAbKwAAIzDgAC5j65V5cS4rkdBo1VNgQ"],
-    30: ["CAACAgIAAxkBAAECaRVoxRnUU7Q1SqXKZmqOZWSuAAHeGBMAAuENAAIxDJhKsojdm6OviV42BA"], # Multiple stickers for level 1
+    30: ["CAACAgIAAxkBAAECaRVoxRnUU7Q1SqXKZmqOZWSuAAHeGBMAAuENAAIxDJhKsojdm6OviV42BA"],
     40: ["CAACAgIAAxkBAAECaRdoxRoGN8TzhAkHosNsA2gmOx5rAgACjwYAAtJaiAEE4A-WIoMiBTYE"],
     50: ["CAACAgIAAxkBAAECaRloxRosJz8PPM_sXS5tYWkrERl1hgACEQEAAiteUwtIyKiZ9C1kczYE"],
     60: ["CAACAgEAAxkBAAECaR1oxRqgy5loi2Bn9H73XIDtgxS5DgACWQoAAr-MkARSHfGoioZ2dDYE"],
@@ -125,43 +161,37 @@ LEVEL_STICKERS = {
 
 # 6. Random level-up messages with user mentions
 LEVEL_UP_MESSAGES = [
-    "🎉 Congrats {}! you’ve leveled up to {level}! 🎉",
+    "🎉 Congrats {}! you've leveled up to {level}! 🎉",
     "🚀 Nice work {}! you just hit Level {level}! 🚀",
     "🔥 Way to go {}! Level {level} unlocked! 🔥",
-    "🌟 Big win {}! you’ve reached Level {level}! 🌟",
+    "🌟 Big win {}! you've reached Level {level}! 🌟",
     "💫 Impressive {}! Level {level} achieved! 💫",
     "🏆 Champion vibes {}! Level {level} conquered! 🏆",
-    "🎊 Cheers {}! you’re officially on Level {level}! 🎊",
+    "🎊 Cheers {}! you're officially on Level {level}! 🎊",
     "⚡ Energy unmatched {}! Level {level} unlocked! ⚡",
-    "👑 King/Queen move {}! you’ve claimed Level {level}! 👑",
-    "💎 Brilliant {}! you’re shining at Level {level}! 💎",
+    "👑 King/Queen move {}! you've claimed Level {level}! 👑",
+    "💎 Brilliant {}! you're shining at Level {level}! 💎",
     "🌈 Amazing {}! Level {level} completed! 🌈",
     "🎯 Spot on {}! you nailed Level {level}! 🎯",
     "🚀 Fast climb {}! Level {level} unlocked! 🚀",
-    "🏅 Gold star {}! you’ve achieved Level {level}! 🏅",
+    "🏅 Gold star {}! you've achieved Level {level}! 🅰️",
     "✨ Sparkling success {}! Level {level} reached! ✨"
 ]
 
 # --- Auto-Delete Functionality ---
-def delete_message_after_delay(bot, chat_id, message_id, delay=60):
+async def delete_message_after_delay(bot, chat_id, message_id, delay=60):
     """Delete a message after a specified delay"""
-    def delete_task():
-        time.sleep(delay)
-        try:
-            bot.delete_message(chat_id=chat_id, message_id=message_id)
-            logger.info(f"Message {message_id} deleted after {delay} seconds")
-        except BadRequest as e:
-            if "Message to delete not found" in str(e):
-                logger.warning(f"Message {message_id} already deleted")
-            else:
-                logger.error(f"Error deleting message {message_id}: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error deleting message {message_id}: {e}")
-    
-    # Start deletion in a separate thread
-    thread = threading.Thread(target=delete_task)
-    thread.daemon = True
-    thread.start()
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Message {message_id} deleted after {delay} seconds")
+    except BadRequest as e:
+        if "Message to delete not found" in str(e):
+            logger.warning(f"Message {message_id} already deleted")
+        else:
+            logger.error(f"Error deleting message {message_id}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error deleting message {message_id}: {e}")
 
 # --- Core Bot Logic ---
 
@@ -175,24 +205,26 @@ def get_level_requirements(level: int) -> int:
 
 def get_or_create_user(session, user_data) -> User:
     """Gets a user from the DB or creates a new one."""
-    db_user = session.query(User).filter(User.user_id == user_data.id).first()
-    if not db_user:
-        db_user = User(
-            user_id=user_data.id,
-            username=user_data.username,
-            first_name=user_data.first_name or "User",
-        )
-        session.add(db_user)
-        try:
+    try:
+        db_user = session.query(User).filter(User.user_id == user_data.id).first()
+        if not db_user:
+            db_user = User(
+                user_id=user_data.id,
+                username=user_data.username,
+                first_name=user_data.first_name or "User",
+            )
+            session.add(db_user)
             session.commit()
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Error creating user: {e}")
-            # Try to get user again in case of race condition
-            db_user = session.query(User).filter(User.user_id == user_data.id).first()
-            if not db_user:
-                raise e
-    return db_user
+            logger.info(f"Created new user: {user_data.id}")
+        return db_user
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Error getting/creating user: {e}")
+        # Try to get user again in case of race condition
+        db_user = session.query(User).filter(User.user_id == user_data.id).first()
+        if not db_user:
+            raise e
+        return db_user
 
 async def generate_level_up_message(level: int, user_mention: str) -> str:
     """Generates a unique level-up message using Gemini AI or random messages."""
@@ -207,12 +239,12 @@ async def generate_level_up_message(level: int, user_mention: str) -> str:
     
     # Fallback to random messages if Gemini fails or is not available
     message_template = random.choice(LEVEL_UP_MESSAGES)
-    return message_template.format(user_mention, level)
+    return message_template.format(user_mention, level=level)
 
 # 2. Command Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao! /help se saare commands dekho.")
-    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
@@ -225,7 +257,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Reply to a message with `/rep` to give reputation to a user."
     )
     msg = await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = Session()
@@ -245,11 +277,11 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}"
         )
         msg = await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     except Exception as e:
         logger.error(f"Error in stats command: {e}")
         msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     finally:
         session.close()
 
@@ -259,7 +291,7 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db_user = get_or_create_user(session, update.effective_user)
         if db_user.level < 100:
             msg = await update.message.reply_text("Prestige ke liye Level 100 tak pahunchna zaroori hai!")
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
             return
 
         db_user.prestige += 1
@@ -275,11 +307,11 @@ async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Aapne Prestige {db_user.prestige} haasil kar liya hai! {prestige_badge}\n"
             f"Aapki level reset ho gayi hai, aur aapko {500 * db_user.prestige} HubCoins ka bonus mila hai. Keep rocking!"
         )
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     except Exception as e:
         logger.error(f"Error in prestige command: {e}")
         msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     finally:
         session.close()
 
@@ -332,7 +364,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             welcome_text = random.choice(welcome_messages) + "\n\n" + random.choice(emoji_combinations)
             msg = await update.message.reply_text(welcome_text)
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id, 120)  # Delete after 2 minutes
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id, 120))  # Delete after 2 minutes
 
             # Har message ke baad 1 second ka intezar karein
             await asyncio.sleep(1) 
@@ -371,20 +403,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Send random level-up message
             level_up_text = await generate_level_up_message(new_level, user_mention)
             level_up_msg = await update.message.reply_text(level_up_text)
-            delete_message_after_delay(context.bot, update.effective_chat.id, level_up_msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, level_up_msg.message_id))
             
             # Send random sticker for this level
             if new_level in LEVEL_STICKERS and LEVEL_STICKERS[new_level]:
                 sticker_msg = await update.message.reply_sticker(random.choice(LEVEL_STICKERS[new_level]))
-                delete_message_after_delay(context.bot, update.effective_chat.id, sticker_msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, sticker_msg.message_id))
             
             # Prestige Prompt at Level 100
             if new_level == 100:
                 prestige_msg = await update.message.reply_text(f"🎉 {user_mention} Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
-                delete_message_after_delay(context.bot, update.effective_chat.id, prestige_msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, prestige_msg.message_id))
         
         # Delete the original user message after 1 minute
-        delete_message_after_delay(context.bot, update.effective_chat.id, update.message.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.message.message_id))
         
         session.commit()
     except Exception as e:
@@ -406,13 +438,13 @@ async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "   `/buy vip`"
     )
     msg = await update.message.reply_text(shop_text, parse_mode=ParseMode.MARKDOWN)
-    delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
     if not args:
         msg = await update.message.reply_text("Kya khareedna hai? Example: `/buy title My Awesome Title`")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
         return
 
     item = args[0].lower()
@@ -424,11 +456,11 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             title_text = " ".join(args[1:])
             if not title_text:
                 msg = await update.message.reply_text("Title likhna zaroori hai. Example: `/buy title The King`")
-                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
                 return
             if db_user.hubcoins < 1000:
                 msg = await update.message.reply_text(f"Iske liye 1000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
                 return
             
             db_user.hubcoins -= 1000
@@ -437,46 +469,46 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             session.commit()
             user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
             msg = await update.message.reply_text(f"Badhai ho {user_mention}! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
 
         elif item == "spotlight":
             if db_user.hubcoins < 2500:
                 msg = await update.message.reply_text(f"Iske liye 2500 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
                 return
             db_user.hubcoins -= 2500
             db_user.spotlight_priority = True
             session.commit()
             user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
             msg = await update.message.reply_text(f"Kharidari safal {user_mention}! Aapko agle spotlight mein priority di jayegi. 🌟")
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
             
         elif item == "vip":
             if db_user.hubcoins < 10000:
                 msg = await update.message.reply_text(f"Iske liye 10000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
                 return
             db_user.hubcoins -= 10000
             db_user.vip_member = True
             session.commit()
             user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
             msg = await update.message.reply_text(f"Welcome to the VIP club {user_mention}! 🎖️ Aapko ab special perks milenge.")
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
         
         else:
             msg = await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
-            delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     except Exception as e:
         logger.error(f"Error in buy command: {e}")
         msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     finally:
         session.close()
 
 async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message.reply_to_message:
         msg = await update.message.reply_text("Yeh command kisi message ko reply karke istemal karein.")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
         return
         
     giver = update.effective_user
@@ -484,7 +516,7 @@ async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     if giver.id == receiver.id:
         msg = await update.message.reply_text("Aap khud ko reputation nahi de sakte!")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
         return
         
     session = Session()
@@ -495,11 +527,11 @@ async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         giver_mention = f"@{giver.username}" if giver.username else giver.first_name
         receiver_mention = f"@{receiver.username}" if receiver.username else receiver.first_name
         msg = await update.message.reply_to_message.reply_text(f"{receiver_mention} ki reputation {giver_mention} ne badhai! Current reputation: {db_receiver.reputation} 👍")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     except Exception as e:
         logger.error(f"Error in rep command: {e}")
         msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id)
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
     finally:
         session.close()
 
@@ -527,17 +559,38 @@ async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         user_mention = f"@{selected_user.username}" if selected_user.username else selected_user.first_name
         spotlight_text = (
-            f"🌟 **Aaj ke Spotlight Member hain {user_mention}!** 🌟\n\n"
-            f"Yeh hamare group ke ek bahut active sadasya hain (Level: {selected_user.level}).\n\n"
-            f"Chaliye, aaj hum sab milkar inko support karte hain! "
-            f"Inke content ko check karein aur feedback dein!"
+            f"🌟 **Spotlight of the Day: {selected_user.get_display_name()}!** 🌟\n\n"
+f"{selected_user.get_display_name()} has been super active in our community (Level: {selected_user.level}).\n\n"
+f"Let’s show some love today—check out their content and drop your feedback! 🚀"
         )
         
         msg = await context.bot.send_message(chat_id=GROUP_ID, text=spotlight_text, parse_mode=ParseMode.MARKDOWN)
-        delete_message_after_delay(context.bot, GROUP_ID, msg.message_id, 3600)  # Delete after 1 hour
+        asyncio.create_task(delete_message_after_delay(context.bot, GROUP_ID, msg.message_id, 3600))  # Delete after 1 hour
         session.commit()
     except Exception as e:
         logger.error(f"Spotlight Error: {e}")
+    finally:
+        session.close()
+
+# Database cleanup job
+async def cleanup_expired_titles(context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Running cleanup job for expired titles...")
+    session = Session()
+    try:
+        expired_users = session.query(User).filter(
+            User.custom_title_expiry.isnot(None),
+            User.custom_title_expiry < datetime.now()
+        ).all()
+        
+        for user in expired_users:
+            user.custom_title = ""
+            user.custom_title_expiry = None
+            logger.info(f"Cleared expired title for user {user.user_id}")
+        
+        session.commit()
+        logger.info(f"Cleared {len(expired_users)} expired titles")
+    except Exception as e:
+        logger.error(f"Cleanup Error: {e}")
     finally:
         session.close()
 
@@ -549,6 +602,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
         logger.warning("Network error detected, waiting before retrying...")
         await asyncio.sleep(5)  # Wait before retrying
+
+# Health check endpoint for Render
+from aiohttp import web
+
+async def health_check(request):
+    return web.Response(text="Bot is running!")
 
 # --- Main Application ---
 def main() -> None:
@@ -581,39 +640,48 @@ def main() -> None:
     # Add handler for new members
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     
-    # Add job queue for spotlight
+    # Add job queue for scheduled tasks
     job_queue = application.job_queue
     # Run spotlight every 24 hours
     job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
+    # Run cleanup every 6 hours
+    job_queue.run_repeating(cleanup_expired_titles, interval=timedelta(hours=6), first=10)
 
-    logger.info("Starting bot polling...")
+    logger.info("Starting bot...")
     
-    # Implement retry logic for network issues
-    max_retries = 5
-    retry_delay = 10  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            application.run_polling(
-                poll_interval=1.0,  # Increased poll interval
-                timeout=30,         # Increased timeout
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
-            break  # If successful, break out of the loop
-        except Exception as e:
-            if "network" in str(e).lower() or "connection" in str(e).lower():
-                logger.error(f"Network error on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    logger.error("Max retries exceeded. Exiting.")
-                    raise
-            else:
-                # Re-raise if it's not a network error
-                raise
+    # Start web server for health checks (required for Render)
+    async def start_web_server():
+        app = web.Application()
+        app.router.add_get('/health', health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
+        logger.info(f"Web server started on port {PORT}")
+
+    # Start the application with both polling and web server
+    async def start_bot():
+        await start_web_server()
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            poll_interval=1.0,
+            timeout=30,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+        
+        # Keep the application running
+        await asyncio.Event().wait()
+
+    try:
+        asyncio.run(start_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+    finally:
+        application.stop()
 
 if __name__ == '__main__':
     main()
