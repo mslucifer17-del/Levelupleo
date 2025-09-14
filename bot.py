@@ -137,7 +137,7 @@ except Exception as e:
 # 4. Gemini AI Initialization
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-pro')
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
     logger.info("Gemini AI configured successfully")
 except Exception as e:
     logger.error(f"Failed to configure Gemini AI: {e}")
