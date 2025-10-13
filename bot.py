@@ -1,939 +1,1379 @@
 # -*- coding: utf-8 -*-
-# LevelUp Leo Bot - Fixed and Enhanced for Render Deployment
+"""
+LevelUp Leo Bot - Professional Edition
+A robust, scalable Telegram bot with advanced leveling system and gamification features
+Version: 2.0.0
+"""
 
 import os
+import sys
 import logging
-import random
 import asyncio
+import json
 import time
 import aiohttp
+import random
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
+from contextlib import asynccontextmanager
+from functools import wraps
+from enum import Enum
+import hashlib
+import hmac
 
 import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    BotCommand
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, 
-    ChatMemberHandler, filters, CallbackQueryHandler
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    ContextTypes, 
+    ChatMemberHandler, 
+    filters, 
+    CallbackQueryHandler,
+    ConversationHandler
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, func, BigInteger, text
-from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
+from telegram.error import BadRequest, TelegramError, NetworkError, TimedOut
+from telegram.helpers import escape_markdown
 
-# --- Configuration ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log", encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+from sqlalchemy import (
+    create_engine, 
+    Column, 
+    Integer, 
+    String, 
+    Boolean, 
+    DateTime, 
+    Float,
+    func, 
+    BigInteger, 
+    text, 
+    JSON,
+    Index
 )
-logger = logging.getLogger(__name__)
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from sqlalchemy.pool import QueuePool
 
-# Environment Variables
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
-GROUP_ID = int(os.environ.get('GROUP_ID', 0))
-PORT = int(os.environ.get('PORT', 8443))
+from cachetools import TTLCache
+from aiohttp import web
+import redis.asyncio as redis
 
-if not all([BOT_TOKEN, GEMINI_API_KEY, GROUP_ID]):
-    logger.critical("CRITICAL ERROR: BOT_TOKEN, GEMINI_API_KEY, or GROUP_ID is missing!")
-    exit()
+# ==================== Configuration ====================
 
-# Database Setup (SQLAlchemy)
+class Config:
+    """Centralized configuration management"""
+    
+    # Environment variables
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+    GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+    DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
+    REDIS_URL = os.environ.get('REDIS_URL')
+    GROUP_ID = int(os.environ.get('GROUP_ID', 0))
+    PORT = int(os.environ.get('PORT', 8443))
+    ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
+    
+    # Rate limiting
+    MAX_MESSAGES_PER_SECOND = 30
+    RATE_LIMIT_WINDOW = 60
+    
+    # Cache settings
+    CACHE_TTL = 300  # 5 minutes
+    USER_CACHE_SIZE = 1000
+    
+    # Bot settings
+    MESSAGE_DELETE_DELAY = 60  # seconds
+    WELCOME_DELETE_DELAY = 120  # seconds
+    SPOTLIGHT_DELETE_DELAY = 3600  # 1 hour
+    
+    # Database settings
+    DB_POOL_SIZE = 20
+    DB_MAX_OVERFLOW = 40
+    DB_POOL_TIMEOUT = 30
+    DB_POOL_RECYCLE = 3600
+    
+    # Validation
+    MAX_TITLE_LENGTH = 20
+    MAX_MESSAGE_LENGTH = 4096
+    
+    @classmethod
+    def validate(cls):
+        """Validate critical configuration"""
+        missing = []
+        if not cls.BOT_TOKEN:
+            missing.append('BOT_TOKEN')
+        if not cls.GEMINI_API_KEY:
+            missing.append('GEMINI_API_KEY')
+        if not cls.GROUP_ID:
+            missing.append('GROUP_ID')
+        
+        if missing:
+            raise ValueError(f"Missing critical environment variables: {', '.join(missing)}")
+
+# ==================== Logging Setup ====================
+
+class CustomFormatter(logging.Formatter):
+    """Custom formatter with colors for console output"""
+    
+    grey = "\x1b[38;21m"
+    yellow = "\x1b[33;21m"
+    red = "\x1b[31;21m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    
+    FORMATS = {
+        logging.DEBUG: grey + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.INFO: grey + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.WARNING: yellow + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.ERROR: red + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.CRITICAL: bold_red + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset
+    }
+    
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+def setup_logging():
+    """Configure comprehensive logging"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG if Config.ENVIRONMENT == 'development' else logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(CustomFormatter())
+    logger.addHandler(console_handler)
+    
+    # File handler with rotation
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        'bot.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# ==================== Database Models ====================
+
 Base = declarative_base()
 
-# Database connection with retry logic
-def create_db_engine():
-    max_retries = 5
-    retry_delay = 5  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            engine = create_engine(
-                DATABASE_URL, 
-                pool_size=10, 
-                max_overflow=20, 
-                pool_timeout=30, 
-                pool_recycle=1800,
-                connect_args={'connect_timeout': 30} if DATABASE_URL.startswith('postgresql') else {}
-            )
-            # Test connection
-            with engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            logger.info("Database connection established successfully")
-            return engine
-        except SQLAlchemyError as e:
-            logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                logger.critical("Max database connection retries exceeded. Exiting.")
-                raise
-
-engine = create_db_engine()
-Session = sessionmaker(bind=engine)
-
 class User(Base):
+    """Enhanced user model with optimized fields and indexes"""
     __tablename__ = 'users'
     
+    # Primary fields
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, unique=True, nullable=False)
-    username = Column(String(255))
+    user_id = Column(BigInteger, unique=True, nullable=False, index=True)
+    username = Column(String(255), index=True)
     first_name = Column(String(255), nullable=False)
     
-    level = Column(Integer, default=0)
+    # Level and progression
+    level = Column(Integer, default=0, index=True)
     messages_count = Column(Integer, default=0)
     prestige = Column(Integer, default=0)
-    hubcoins = Column(Integer, default=10) # Start with 10 coins
+    hubcoins = Column(Integer, default=100)
     reputation = Column(Integer, default=0)
+    xp = Column(Integer, default=0)
     
-    last_message_date = Column(DateTime)
-    join_date = Column(DateTime, default=datetime.now)
+    # Timestamps
+    last_message_date = Column(DateTime, index=True)
+    join_date = Column(DateTime, default=datetime.utcnow)
+    last_active = Column(DateTime, default=datetime.utcnow)
     
     # Shop & Perks
     vip_member = Column(Boolean, default=False)
+    vip_expiry = Column(DateTime)
     custom_title = Column(String(50), default="")
     custom_title_expiry = Column(DateTime)
     spotlight_priority = Column(Boolean, default=False)
+    boost_active = Column(Boolean, default=False)
+    boost_expiry = Column(DateTime)
     
-    # New fields for enhanced features
+    # Streaks and achievements
     daily_streak = Column(Integer, default=0)
     last_daily_date = Column(DateTime)
-    achievements = Column(String(500), default="")  # Store as JSON string
+    achievements = Column(JSON, default=dict)
+    badges = Column(JSON, default=list)
+    
+    # Anti-spam and rate limiting
+    message_timestamps = Column(JSON, default=list)
+    warnings = Column(Integer, default=0)
+    is_banned = Column(Boolean, default=False)
+    ban_reason = Column(String(255))
+    
+    # Statistics
+    total_xp_earned = Column(Integer, default=0)
+    total_coins_earned = Column(Integer, default=0)
+    total_coins_spent = Column(Integer, default=0)
+    
+    # Indexes for performance
+    __table_args__ = (
+        Index('idx_user_level_messages', 'level', 'messages_count'),
+        Index('idx_user_activity', 'last_message_date', 'last_active'),
+    )
     
     def get_display_name(self):
-        title = f" [{self.custom_title}]" if self.custom_title else ""
-        prestige_badge = '🌟' * self.prestige if self.prestige > 0 else ''
-        return f"{self.first_name}{title}{prestige_badge}"
+        """Get formatted display name with badges"""
+        title = f" [{self.custom_title}]" if self.custom_title and not self._is_title_expired() else ""
+        vip_badge = " 👑" if self.vip_member and not self._is_vip_expired() else ""
+        prestige_badge = '⭐' * min(self.prestige, 5) if self.prestige > 0 else ''
+        return f"{self.first_name}{title}{vip_badge}{prestige_badge}"
+    
+    def _is_title_expired(self):
+        """Check if custom title has expired"""
+        if not self.custom_title_expiry:
+            return False
+        return datetime.utcnow() > self.custom_title_expiry
+    
+    def _is_vip_expired(self):
+        """Check if VIP status has expired"""
+        if not self.vip_expiry:
+            return False
+        return datetime.utcnow() > self.vip_expiry
+    
+    def to_dict(self):
+        """Convert user to dictionary for caching"""
+        return {
+            'user_id': self.user_id,
+            'username': self.username,
+            'first_name': self.first_name,
+            'level': self.level,
+            'messages_count': self.messages_count,
+            'hubcoins': self.hubcoins,
+            'prestige': self.prestige,
+            'vip_member': self.vip_member,
+            'achievements': self.achievements or {}
+        }
 
-# Function to check and alter table if needed
-def check_and_alter_table():
-    try:
-        with engine.connect() as conn:
-            # Check if user_id column is INTEGER type
-            result = conn.execute(text("""
-                SELECT data_type 
-                FROM information_schema.columns 
-                WHERE table_name = 'users' AND column_name = 'user_id';
-            """))
-            row = result.fetchone()
-            if row and row[0] == 'integer':
-                logger.info("Changing user_id column from integer to bigint")
-                conn.execute(text("ALTER TABLE users ALTER COLUMN user_id TYPE BIGINT;"))
-                conn.commit()
-                logger.info("Column type changed successfully")
-    except Exception as e:
-        logger.error(f"Error checking/altering table: {e}")
+# ==================== Database Manager ====================
 
-# Create tables and check column types
-try:
-    Base.metadata.create_all(engine)
-    # Check if we need to alter the user_id column for PostgreSQL
-    if DATABASE_URL.startswith('postgresql'):
-        check_and_alter_table()
-except Exception as e:
-    logger.error(f"Error creating database tables: {e}")
-
-# Gemini AI Initialization
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-    logger.info("Gemini AI configured successfully")
-except Exception as e:
-    logger.error(f"Failed to configure Gemini AI: {e}")
-    gemini_model = None
-
-# Sticker IDs
-LEVEL_STICKERS = {
-    1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"],
-    2: ["CAACAgEAAxkBAAECaP1oxRfMvKFVsuGdqgFtWL8LoqKjMQACBQMAAnNOIERFC6_h0W0SgDYE"],
-    4: ["CAACAgEAAxkBAAECaQFoxRf1T3qdVXZN623-6KUJarP_hQACfQMAAj7OWETdjsszH42-rzYE"],
-    10: ["CAACAgIAAxkBAAECaQVoxRgnf9Tl_egizv2IzRq-p4JDPgACWDEAAvTKMEpYpE1ML4rwgTYE"],
-    15: ["CgACAgQAAxkBAAECaQdoxRidErmqz3qB1miEt6Bf38ty2QACVwMAAolPBFMwDn_gBXkQejYE"],
-    20: ["CAACAgUAAxkBAAECaQ9oxRkWl7-xcGPLi-lwXgABsioAAbKwAAIzDgAC5j65V5cS4rkdBo1VNgQ"],
-    30: ["CAACAgIAAxkBAAECaRVoxRnUU7Q1SqXKZmqOZWSuAAHeGBMAAuENAAIxDJhKsojdm6OziV42BA"],
-    40: ["CAACAgIAAxkBAAECaRdoxRoGN8TzhAkHosNsA2gmOx5rAgACjwYAAtJaiAEE4A-WIoMiBTYE"],
-    50: ["CAACAgIAAxkBAAECaRloxRosJz8PPM_sXS5tYWkrERl1hgACEQEAAiteUwtIyKiZ9C1kczYE"],
-    60: ["CAACAgEAAxkBAAECaR1oxRqgy5loi2Bn9H73XIDtgxS5DgACWQoAAr-MkARSHfGoioZ2dDYE"],
-    70: ["CAACAgIAAxkBAAECaR9oxRsy5ik6Lafehl768jrOYUAgxgACMAADWbv8Jb2cViz8YDqINgQ"],
-    100: ["CgACAgQAAxkBAAECaSNoxRyHpjl-ewc5MSsrH1KN5fGleQACXQcAApuxnVCKrIelHCgSAzYE"]
-}
-
-# Random level-up messages with user mentions
-LEVEL_UP_MESSAGES = [
-    "🎉 Congrats {}! you've leveled up to {level}! 🎉",
-    "🚀 Nice work {}! you just hit Level {level}! 🚀",
-    "🔥 Way to go {}! Level {level} unlocked! 🔥",
-    "🌟 Big win {}! you've reached Level {level}! 🌟",
-    "💫 Impressive {}! Level {level} achieved! 💫",
-    "🏆 Champion vibes {}! Level {level} conquered! 🏆",
-    "🎊 Cheers {}! you're officially on Level {level}! 🎊",
-    "⚡ Energy unmatched {}! Level {level} unlocked! ⚡",
-    "👑 King/Queen move {}! you've claimed Level {level}! 👑",
-    "💎 Brilliant {}! you're shining at Level {level}! 💎",
-    "🌈 Amazing {}! Level {level} completed! 🌈",
-    "🎯 Spot on {}! you nailed Level {level}! 🎯",
-    "🚀 Fast climb {}! Level {level} unlocked! 🚀",
-    "🏅 Gold star {}! you've achieved Level {level}! 🅰️",
-    "✨ Sparkling success {}! Level {level} reached! ✨"
-]
-
-# Achievement System
-ACHIEVEMENTS = {
-    "first_message": {"name": "First Words", "description": "Send your first message", "reward": 50},
-    "level_10": {"name": "Rising Star", "description": "Reach level 10", "reward": 100},
-    "level_50": {"name": "Half Century", "description": "Reach level 50", "reward": 500},
-    "level_100": {"name": "Centurion", "description": "Reach level 100", "reward": 1000},
-    "vip": {"name": "Elite Member", "description": "Purchase VIP status", "reward": 200},
-    "streak_7": {"name": "Consistent", "description": "7-day message streak", "reward": 150},
-    "streak_30": {"name": "Dedicated", "description": "30-day message streak", "reward": 500},
-}
-
-# --- Auto-Delete Functionality ---
-async def delete_message_after_delay(bot, chat_id, message_id, delay=60):
-    """Delete a message after a specified delay"""
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Message {message_id} deleted after {delay} seconds")
-    except BadRequest as e:
-        if "Message to delete not found" in str(e):
-            logger.warning(f"Message {message_id} already deleted")
-        else:
-            logger.error(f"Error deleting message {message_id}: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error deleting message {message_id}: {e}")
-
-# --- Core Bot Logic ---
-
-# 1. Helper Functions
-def get_level_requirements(level: int) -> int:
-    """Calculates total messages needed for a certain level using a progressive formula."""
-    if level <= 10: return level * 10
-    elif level <= 25: return 100 + (level - 10) * 25
-    elif level <= 50: return 475 + (level - 25) * 50
-    else: return 1725 + (level - 50) * 100
-
-def get_or_create_user(session, user_data) -> User:
-    """Gets a user from the DB or creates a new one."""
-    try:
-        db_user = session.query(User).filter(User.user_id == user_data.id).first()
-        if not db_user:
-            db_user = User(
-                user_id=user_data.id,
-                username=user_data.username,
-                first_name=user_data.first_name or "User",
-            )
-            session.add(db_user)
-            session.commit()
-            logger.info(f"Created new user: {user_data.id}")
-        return db_user
-    except SQLAlchemyError as e:
-        session.rollback()
-        logger.error(f"Error getting/creating user: {e}")
-        # Try to get user again in case of race condition
-        db_user = session.query(User).filter(User.user_id == user_data.id).first()
-        if not db_user:
-            raise e
-        return db_user
-
-async def generate_level_up_message(level: int, user_mention: str) -> str:
-    """Generates a unique level-up message using Gemini AI or random messages."""
-    # Use Gemini if available
-    if gemini_model:
-        prompt = f"Write a very short, cool, and motivating message in Hinglish for a user who just reached Level {level} in a Telegram group. Mention the level. Be creative and fun."
+class DatabaseManager:
+    """Robust database connection and session management"""
+    
+    def __init__(self):
+        self.engine = None
+        self.Session = None
+        self._setup_database()
+    
+    def _setup_database(self):
+        """Setup database with connection pooling and retry logic"""
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # Create engine with optimized settings
+                self.engine = create_engine(
+                    Config.DATABASE_URL,
+                    poolclass=QueuePool,
+                    pool_size=Config.DB_POOL_SIZE,
+                    max_overflow=Config.DB_MAX_OVERFLOW,
+                    pool_timeout=Config.DB_POOL_TIMEOUT,
+                    pool_recycle=Config.DB_POOL_RECYCLE,
+                    pool_pre_ping=True,  # Verify connections before using
+                    echo=Config.ENVIRONMENT == 'development',
+                    connect_args={
+                        'connect_timeout': 10,
+                        'options': '-c statement_timeout=30000'  # 30 second statement timeout
+                    } if Config.DATABASE_URL.startswith('postgresql') else {}
+                )
+                
+                # Test connection
+                with self.engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                
+                # Create tables
+                Base.metadata.create_all(self.engine)
+                
+                # Setup session factory
+                self.Session = scoped_session(sessionmaker(
+                    bind=self.engine,
+                    expire_on_commit=False
+                ))
+                
+                logger.info("Database connection established successfully")
+                return
+                
+            except SQLAlchemyError as e:
+                logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                else:
+                    logger.critical("Failed to connect to database after maximum retries")
+                    raise
+    
+    @asynccontextmanager
+    async def get_session(self):
+        """Async context manager for database sessions"""
+        session = self.Session()
         try:
-            response = await asyncio.to_thread(
-                gemini_model.generate_content, 
-                prompt, 
-                safety_settings={'HARASSMENT':'block_none'}
-            )
-            return f"{user_mention} {response.text.strip()}"
-        except Exception as e:
-            logger.error(f"Gemini Error: {e}")
-    
-    # Fallback to random messages if Gemini fails or is not available
-    message_template = random.choice(LEVEL_UP_MESSAGES)
-    return message_template.format(user_mention, level=level)
-
-async def check_achievements(session, user, achievement_type):
-    """Check and award achievements to users."""
-    if not user.achievements:
-        user.achievements = ""
-    
-    if achievement_type in user.achievements:
-        return False
-        
-    achievement = ACHIEVEMENTS.get(achievement_type)
-    if not achievement:
-        return False
-        
-    user.achievements += f"{achievement_type},"
-    user.hubcoins += achievement["reward"]
-    session.commit()
-    
-    return achievement
-
-# 2. Command Handlers
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data='stats'),
-         InlineKeyboardButton("🛒 Shop", callback_data='shop')],
-        [InlineKeyboardButton("🌟 Premium", callback_data='premium'),
-         InlineKeyboardButton("❓ Help", callback_data='help')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    msg = await update.message.reply_text(
-        "Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao!",
-        reply_markup=reply_markup
-    )
-    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = (
-        "📜 **LevelUp Leo Commands** 📜\n\n"
-        "`/stats` - Apni level, coins aur progress dekho.\n"
-        "`/coins` - Apne HubCoins ka balance dekho.\n"
-        "`/shop` - Dekho ki tum HubCoins se kya khareed sakte ho.\n"
-        "`/buy [item]` - Shop se kuch khareedo (e.g., `/buy title`)\n"
-        "`/prestige` - Level 100 ke baad special badge ke liye level reset karo.\n"
-        "`/daily` - Roz ka reward claim karo.\n"
-        "Reply to a message with `/rep` to give reputation to a user."
-    )
-    msg = await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, update.effective_user)
-        
-        req_for_next = get_level_requirements(db_user.level + 1)
-        messages_for_next = max(0, req_for_next - db_user.messages_count)
-        
-        # Create a visual progress bar
-        progress = (db_user.messages_count - get_level_requirements(db_user.level)) / (req_for_next - get_level_requirements(db_user.level)) * 100
-        progress = max(0, min(100, progress))
-        progress_bar = "[" + "█" * int(progress / 5) + "░" * (20 - int(progress / 5)) + "]"
-        
-        stats_text = (
-            f"📊 **{db_user.get_display_name()}'s Stats** 📊\n\n"
-            f"• **Level:** {db_user.level} (Prestige {db_user.prestige}🌟)\n"
-            f"• **Progress to next level:** {progress:.1f}%\n{progress_bar}\n"
-            f"• **Messages:** {db_user.messages_count}\n"
-            f"• **HubCoins:** {db_user.hubcoins} 💰\n"
-            f"• **Reputation:** {db_user.reputation} 👍\n"
-            f"• **Daily Streak:** {db_user.daily_streak or 0} days 🔥\n"
-            f"• **Next Level:** in {messages_for_next} messages.\n"
-            f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}\n"
-            f"• **Achievements:** {len(db_user.achievements.split(',')) if db_user.achievements else 0} 🏆"
-        )
-        msg = await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    except Exception as e:
-        logger.error(f"Error in stats command: {e}")
-        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    finally:
-        session.close()
-
-async def prestige_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, update.effective_user)
-        if db_user.level < 100:
-            msg = await update.message.reply_text("Prestige ke liye Level 100 tak pahunchna zaroori hai!")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-            return
-
-        db_user.prestige += 1
-        db_user.level = 1
-        db_user.messages_count = 0
-        db_user.hubcoins += 500 * db_user.prestige # More coins for higher prestige
-        session.commit()
-
-        user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
-        prestige_badge = '🌟' * db_user.prestige
-        msg = await update.message.reply_text(
-            f"🎊 CONGRATULATIONS, {user_mention}! 🎊\n\n"
-            f"Aapne Prestige {db_user.prestige} haasil kar liya hai! {prestige_badge}\n"
-            f"Aapki level reset ho gayi hai, aur aapko {500 * db_user.prestige} HubCoins ka bonus mila hai. Keep rocking!"
-        )
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    except Exception as e:
-        logger.error(f"Error in prestige command: {e}")
-        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    finally:
-        session.close()
-
-async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, update.effective_user)
-        
-        today = datetime.now().date()
-        last_daily = db_user.last_daily_date.date() if db_user.last_daily_date else None
-        
-        if last_daily and last_daily == today:
-            msg = await update.message.reply_text("Aap aaj ka daily reward already le chuke hain! Kal fir try karein.")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-            return
-        
-        # Calculate streak
-        streak = db_user.daily_streak or 0
-        if last_daily and (today - last_daily).days == 1:
-            streak += 1
-        else:
-            streak = 1
-        
-        # Calculate reward based on streak
-        base_reward = 50
-        streak_bonus = min(100, streak * 5)  # Max 100 coin bonus
-        total_reward = base_reward + streak_bonus
-        
-        # Update user
-        db_user.daily_streak = streak
-        db_user.last_daily_date = datetime.now()
-        db_user.hubcoins += total_reward
-        session.commit()
-        
-        msg = await update.message.reply_text(
-            f"🎉 Daily Reward Claimed! 🎉\n"
-            f"Aapko mile {total_reward} HubCoins!\n"
-            f"Streak: {streak} days\n"
-            f"Kal fir aaye aur zyada coins kamayein!"
-        )
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-        
-        # Check for streak achievements
-        if streak == 7:
-            await check_achievements(session, db_user, 'streak_7')
-        elif streak == 30:
-            await check_achievements(session, db_user, 'streak_30')
-            
-    except Exception as e:
-        logger.error(f"Error in daily command: {e}")
-        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    finally:
-        session.close()
-
-# 3. Message and Member Handlers
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    for member in update.message.new_chat_members:
-        session = Session()
-        try:
-            get_or_create_user(session, member) # User ko DB mein add karein
-            
-            # Use username if available, otherwise first name
-            user_mention = f"@{member.username}" if member.username else member.first_name
-            
-            # Gen-Z style welcome messages with different fonts and emojis
-            welcome_messages = [
-                f"✨ 𝗪𝗲𝗹𝗰𝗺 {user_mention}  ✨\n\n"
-                f"🎯 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗧𝗵𝗲𝗣𝗿𝗼𝗺𝗼𝘁𝗶𝗼𝗻𝗛𝘂𝗯  🎯\n\n"
-                f"🌟 𝗬𝗼𝘂𝗿 𝗷𝗼𝘂𝗿𝗻𝗲𝘆 𝗯𝗲𝗴𝗶𝗻𝘀 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬  🌟\n"
-                f"💬 𝗗𝗿𝗼𝗽 𝗺𝗲𝘀𝘀𝗮𝗴𝗲𝘀, 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽 & 𝗲𝗮𝗿𝗻 𝗿𝗲𝘄𝗮𝗿𝗱𝘀  💬",
-                
-                f"🔥 𝗪𝗲𝗹𝗰𝗼𝗺𝗲 {user_mention}  🔥\n\n"
-                f"🎊 𝗧𝗵𝗮𝗻𝗸𝘀 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝘁𝗵𝗲 𝗳𝗮𝗺  🎊\n\n"
-                f"🚀 𝗖𝘂𝗿𝗿𝗲𝗻𝘁 𝗹𝗲𝘃𝗲𝗹: 𝟬  🚀\n"
-                f"💎 𝗦𝘁𝗮𝗿𝘁 𝗰𝗵𝗮𝘁𝘁𝗶𝗻𝗴 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  💎",
-                
-                f"💫 𝗪𝗲𝗹𝗰𝗺 {user_mention}  💫\n\n"
-                f"🌸 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗼𝘂𝗿 𝗰𝗼𝗺𝗺𝘂𝗻𝗶𝘁𝘆  🌸\n\n"
-                f"📈 𝗬𝗼𝘂'𝗿𝗲 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬 𝗻𝗼𝘄  📈\n"
-                f"🎯 𝗦𝗲𝗻𝗱 𝗺𝗲𝘀𝘀𝗮𝗴𝗲𝘀 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  🎯",
-                
-                f"🎉 𝗪𝗲𝗹𝗰𝗼𝗺𝗲 {user_mention}  🎉\n\n"
-                f"💖 𝗧𝗵𝗮𝗻𝗸𝘀 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝗧𝗵𝗲𝗣𝗿𝗼𝗺𝗼𝘁𝗶𝗼𝗻𝗛𝘂𝗯  💖\n\n"
-                f"✨ 𝗦𝘁𝗮𝗿𝘁𝗶𝗻𝗴 𝗹𝗲𝘃𝗲𝗹: 𝟬  ✨\n"
-                f"🔥 𝗖𝗵𝗮𝘁 𝘁𝗼 𝗶𝗻𝗰𝗿𝗲𝗮𝘀𝗲 𝘆𝗼𝘂𝗿 𝗹𝗲𝘃𝗲𝗹  🔥",
-                
-                f"🌟 𝗪𝗲𝗹𝗰𝗺 {user_mention}  🌟\n\n"
-                f"🎁 𝗧𝗾𝗾 𝗳𝗼𝗿 𝗷𝗼𝗶𝗻𝗶𝗻𝗴 𝘁𝗵𝗲 𝗵𝘂𝗯  🎁\n\n"
-                f"🚀 𝗬𝗼𝘂'𝗿𝗲 𝗮𝘁 𝗹𝗲𝘃𝗲𝗹 𝟬  🚀\n"
-                f"💎 𝗦𝘁𝗮𝗿𝘁 𝗺𝗲𝘀𝘀𝗮𝗴𝗶𝗻𝗴 𝘁𝗼 𝗹𝗲𝘃𝗲𝗹 𝘂𝗽  💎"
-            ]
-            
-            # Random emoji combinations to add at the end
-            emoji_combinations = [
-                "✨🔥💫🌟🎯",
-                "🚀💎🎊🌸💖",
-                "🎉🔥🌟💫✨",
-                "💎🚀🎯💖🌸",
-                "✨🎊🔥💎🌟"
-            ]
-            
-            welcome_text = random.choice(welcome_messages) + "\n\n" + random.choice(emoji_combinations)
-            msg = await update.message.reply_text(welcome_text)
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id, 120))  # Delete after 2 minutes
-
-            # Har message ke baad 1 second ka intezar karein
-            await asyncio.sleep(1) 
-
-        except Exception as e:
-            logger.error(f"Welcome message error for {member.id}: {e}")
+            yield session
+            await asyncio.to_thread(session.commit)
+        except SQLAlchemyError as e:
+            await asyncio.to_thread(session.rollback)
+            logger.error(f"Database error: {e}")
+            raise
         finally:
-            session.close()
-            
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user or update.effective_chat.id != GROUP_ID:
-        return # Process messages only from the main group
-
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, update.effective_user)
-        
-        # Update counts
-        db_user.messages_count += 1
-        db_user.last_message_date = datetime.now()
-        db_user.hubcoins += random.randint(1, 3) # Earn 1-3 coins per message
-        
-        # Check for first message achievement
-        if db_user.messages_count == 1:
-            await check_achievements(session, db_user, 'first_message')
-        
-        # Level Up Check
-        old_level = db_user.level
-        new_level = 0
-        while db_user.messages_count >= get_level_requirements(new_level + 1):
-            new_level += 1
-        
-        if new_level > old_level:
-            db_user.level = new_level
-            db_user.hubcoins += new_level * 10 # Bonus coins on level up
-            
-            # Check for level achievements
-            if new_level == 10:
-                await check_achievements(session, db_user, 'level_10')
-            elif new_level == 50:
-                await check_achievements(session, db_user, 'level_50')
-            elif new_level == 100:
-                await check_achievements(session, db_user, 'level_100')
-            
-            # Create user mention
-            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
-            
-            # Send random level-up message
-            level_up_text = await generate_level_up_message(new_level, user_mention)
-            level_up_msg = await update.message.reply_text(level_up_text)
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, level_up_msg.message_id))
-            
-            # Send random sticker for this level
-            if new_level in LEVEL_STICKERS and LEVEL_STICKERS[new_level]:
-                sticker_msg = await update.message.reply_sticker(random.choice(LEVEL_STICKERS[new_level]))
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, sticker_msg.message_id))
-            
-            # Prestige Prompt at Level 100
-            if new_level == 100:
-                prestige_msg = await update.message.reply_text(f"🎉 {user_mention} Aap Level 100 par pahunch gaye hain! Special badge ke liye /prestige command ka istemal karein!")
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, prestige_msg.message_id))
-        
-        # Delete the original user message after 1 minute
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.message.message_id))
-        
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error handling message: {e}")
-    finally:
-        session.close()
-
-# 4. Economy and Advanced Features
-async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [InlineKeyboardButton("🎭 Custom Title (1000)", callback_data='shop_title')],
-        [InlineKeyboardButton("🌟 Spotlight (2500)", callback_data='shop_spotlight')],
-        [InlineKeyboardButton("👑 VIP Status (10000)", callback_data='shop_vip')],
-        [InlineKeyboardButton("🎨 Name Color (1500)", callback_data='shop_color')],
-        [InlineKeyboardButton("🚀 Daily Boost (500)", callback_data='shop_boost')],
-        [InlineKeyboardButton("« Back", callback_data='main_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+            await asyncio.to_thread(session.close)
     
-    shop_text = (
-        "🛒 **ThePromotionHub Shop** 🛒\n\n"
-        "Apne HubCoins se yeh items khareedo:\n\n"
-        "Har item ke liye button dabao details dekhne ke liye!"
-    )
+    def close(self):
+        """Close database connections"""
+        if self.Session:
+            self.Session.remove()
+        if self.engine:
+            self.engine.dispose()
+
+# ==================== Cache Manager ====================
+
+class CacheManager:
+    """Centralized caching system"""
     
-    msg = await update.message.reply_text(shop_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-
-async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    if not args:
-        msg = await update.message.reply_text("Kya khareedna hai? Example: `/buy title My Awesome Title`")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-        return
-
-    item = args[0].lower()
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, update.effective_user)
+    def __init__(self):
+        self.user_cache = TTLCache(maxsize=Config.USER_CACHE_SIZE, ttl=Config.CACHE_TTL)
+        self.rate_limit_cache = TTLCache(maxsize=1000, ttl=Config.RATE_LIMIT_WINDOW)
+        self.redis_client = None
+        self._setup_redis()
+    
+    async def _setup_redis(self):
+        """Setup Redis connection if available"""
+        if Config.REDIS_URL:
+            try:
+                self.redis_client = await redis.from_url(Config.REDIS_URL)
+                await self.redis_client.ping()
+                logger.info("Redis cache connected successfully")
+            except Exception as e:
+                logger.warning(f"Redis connection failed, using in-memory cache: {e}")
+    
+    async def get_user(self, user_id: int) -> Optional[Dict]:
+        """Get user from cache"""
+        # Try memory cache first
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
         
-        if item == "title":
-            title_text = " ".join(args[1:])
-            if not title_text:
-                msg = await update.message.reply_text("Title likhna zaroori hai. Example: `/buy title The King`")
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-                return
-            if db_user.hubcoins < 1000:
-                msg = await update.message.reply_text(f"Iske liye 1000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-                return
-            
-            db_user.hubcoins -= 1000
-            db_user.custom_title = title_text[:20] # Max 20 chars
-            db_user.custom_title_expiry = datetime.now() + timedelta(days=7)
-            session.commit()
-            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
-            msg = await update.message.reply_text(f"Badhai ho {user_mention}! Aapka naya title '{db_user.custom_title}' ek hafte ke liye set ho gaya hai.")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-
-        elif item == "spotlight":
-            if db_user.hubcoins < 2500:
-                msg = await update.message.reply_text(f"Iske liye 2500 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-                return
-            db_user.hubcoins -= 2500
-            db_user.spotlight_priority = True
-            session.commit()
-            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
-            msg = await update.message.reply_text(f"Kharidari safal {user_mention}! Aapko agle spotlight mein priority di jayegi. 🌟")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-            
-        elif item == "vip":
-            if db_user.hubcoins < 10000:
-                msg = await update.message.reply_text(f"Iske liye 10000 HubCoins chahiye. Aapke paas {db_user.hubcoins} hain.")
-                asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-                return
-            db_user.hubcoins -= 10000
-            db_user.vip_member = True
-            session.commit()
-            
-            # Check for VIP achievement
-            await check_achievements(session, db_user, 'vip')
-            
-            user_mention = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
-            msg = await update.message.reply_text(f"Welcome to the VIP club {user_mention}! 🎖️ Aapko ab special perks milenge.")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
+        # Try Redis if available
+        if self.redis_client:
+            try:
+                data = await self.redis_client.get(f"user:{user_id}")
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.error(f"Redis get error: {e}")
         
+        return None
+    
+    async def set_user(self, user_id: int, user_data: Dict):
+        """Cache user data"""
+        self.user_cache[user_id] = user_data
+        
+        if self.redis_client:
+            try:
+                await self.redis_client.setex(
+                    f"user:{user_id}",
+                    Config.CACHE_TTL,
+                    json.dumps(user_data)
+                )
+            except Exception as e:
+                logger.error(f"Redis set error: {e}")
+    
+    async def check_rate_limit(self, user_id: int) -> bool:
+        """Check if user is rate limited"""
+        key = f"rate:{user_id}"
+        current_count = self.rate_limit_cache.get(key, 0)
+        
+        if current_count >= Config.MAX_MESSAGES_PER_SECOND:
+            return False
+        
+        self.rate_limit_cache[key] = current_count + 1
+        return True
+
+# ==================== Input Validator ====================
+
+class InputValidator:
+    """Comprehensive input validation and sanitization"""
+    
+    @staticmethod
+    def validate_title(title: str) -> Tuple[bool, str]:
+        """Validate custom title"""
+        if not title:
+            return False, "Title cannot be empty"
+        
+        if len(title) > Config.MAX_TITLE_LENGTH:
+            return False, f"Title must be {Config.MAX_TITLE_LENGTH} characters or less"
+        
+        # Check for inappropriate content
+        banned_words = ['admin', 'mod', 'owner', 'official']
+        if any(word in title.lower() for word in banned_words):
+            return False, "Title contains restricted words"
+        
+        # Sanitize
+        title = title.strip()
+        if not title.replace(' ', '').isalnum():
+            return False, "Title can only contain letters, numbers, and spaces"
+        
+        return True, title
+    
+    @staticmethod
+    def validate_amount(amount: str) -> Tuple[bool, int]:
+        """Validate numeric amount"""
+        try:
+            value = int(amount)
+            if value <= 0:
+                return False, 0
+            if value > 1000000:  # Max limit
+                return False, 0
+            return True, value
+        except ValueError:
+            return False, 0
+    
+    @staticmethod
+    def sanitize_message(text: str) -> str:
+        """Sanitize message text"""
+        if not text:
+            return ""
+        
+        # Truncate if too long
+        if len(text) > Config.MAX_MESSAGE_LENGTH:
+            text = text[:Config.MAX_MESSAGE_LENGTH] + "..."
+        
+        # Escape markdown
+        text = escape_markdown(text, version=2)
+        
+        return text
+
+# ==================== Achievement System ====================
+
+class AchievementManager:
+    """Advanced achievement and badge system"""
+    
+    ACHIEVEMENTS = {
+        # Message achievements
+        "first_message": {
+            "name": "First Words",
+            "description": "Send your first message",
+            "reward": 50,
+            "icon": "🎯"
+        },
+        "message_100": {
+            "name": "Chatterbox",
+            "description": "Send 100 messages",
+            "reward": 100,
+            "icon": "💬"
+        },
+        "message_1000": {
+            "name": "Conversation Master",
+            "description": "Send 1000 messages",
+            "reward": 500,
+            "icon": "🗣️"
+        },
+        
+        # Level achievements
+        "level_10": {
+            "name": "Rising Star",
+            "description": "Reach level 10",
+            "reward": 100,
+            "icon": "⭐"
+        },
+        "level_50": {
+            "name": "Half Century",
+            "description": "Reach level 50",
+            "reward": 500,
+            "icon": "🌟"
+        },
+        "level_100": {
+            "name": "Centurion",
+            "description": "Reach level 100",
+            "reward": 1000,
+            "icon": "💯"
+        },
+        
+        # Streak achievements
+        "streak_7": {
+            "name": "Week Warrior",
+            "description": "7-day message streak",
+            "reward": 150,
+            "icon": "🔥"
+        },
+        "streak_30": {
+            "name": "Monthly Master",
+            "description": "30-day message streak",
+            "reward": 500,
+            "icon": "🏆"
+        },
+        "streak_100": {
+            "name": "Century Streak",
+            "description": "100-day message streak",
+            "reward": 2000,
+            "icon": "💎"
+        },
+        
+        # Special achievements
+        "vip": {
+            "name": "Elite Member",
+            "description": "Purchase VIP status",
+            "reward": 200,
+            "icon": "👑"
+        },
+        "prestige_1": {
+            "name": "Prestige Pioneer",
+            "description": "Achieve first prestige",
+            "reward": 1000,
+            "icon": "🌟"
+        },
+        "rich": {
+            "name": "Wealthy",
+            "description": "Accumulate 10,000 coins",
+            "reward": 500,
+            "icon": "💰"
+        }
+    }
+    
+    @classmethod
+    async def check_and_award(cls, user: User, achievement_key: str) -> Optional[Dict]:
+        """Check and award achievement to user"""
+        if not user.achievements:
+            user.achievements = {}
+        
+        # Already has achievement
+        if achievement_key in user.achievements:
+            return None
+        
+        achievement = cls.ACHIEVEMENTS.get(achievement_key)
+        if not achievement:
+            return None
+        
+        # Award achievement
+        user.achievements[achievement_key] = {
+            'earned_at': datetime.utcnow().isoformat(),
+            'name': achievement['name'],
+            'icon': achievement['icon']
+        }
+        user.hubcoins += achievement['reward']
+        user.total_coins_earned += achievement['reward']
+        
+        logger.info(f"User {user.user_id} earned achievement: {achievement_key}")
+        return achievement
+    
+    @classmethod
+    async def check_all_achievements(cls, user: User) -> List[Dict]:
+        """Check all possible achievements for a user"""
+        earned = []
+        
+        # Message achievements
+        if user.messages_count >= 1:
+            achievement = await cls.check_and_award(user, 'first_message')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.messages_count >= 100:
+            achievement = await cls.check_and_award(user, 'message_100')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.messages_count >= 1000:
+            achievement = await cls.check_and_award(user, 'message_1000')
+            if achievement:
+                earned.append(achievement)
+        
+        # Level achievements
+        if user.level >= 10:
+            achievement = await cls.check_and_award(user, 'level_10')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.level >= 50:
+            achievement = await cls.check_and_award(user, 'level_50')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.level >= 100:
+            achievement = await cls.check_and_award(user, 'level_100')
+            if achievement:
+                earned.append(achievement)
+        
+        # Streak achievements
+        if user.daily_streak >= 7:
+            achievement = await cls.check_and_award(user, 'streak_7')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.daily_streak >= 30:
+            achievement = await cls.check_and_award(user, 'streak_30')
+            if achievement:
+                earned.append(achievement)
+        
+        if user.daily_streak >= 100:
+            achievement = await cls.check_and_award(user, 'streak_100')
+            if achievement:
+                earned.append(achievement)
+        
+        # Wealth achievement
+        if user.hubcoins >= 10000:
+            achievement = await cls.check_and_award(user, 'rich')
+            if achievement:
+                earned.append(achievement)
+        
+        # Prestige achievement
+        if user.prestige >= 1:
+            achievement = await cls.check_and_award(user, 'prestige_1')
+            if achievement:
+                earned.append(achievement)
+        
+        return earned
+
+# ==================== Level System ====================
+
+class LevelSystem:
+    """Advanced leveling and progression system"""
+    
+    # Level stickers mapping
+    LEVEL_STICKERS = {
+        1: ["CAACAgEAAxkBAAECZohow8nXm9oFdxnWioDIioN6859S4wACpQIAAkb-8Ec467BfJxQ8djYE"],
+        5: ["CAACAgEAAxkBAAECaP1oxRfMvKFVsuGdqgFtWL8LoqKjMQACBQMAAnNOIERFC6_h0W0SgDYE"],
+        10: ["CAACAgEAAxkBAAECaQFoxRf1T3qdVXZN623-6KUJarP_hQACfQMAAj7OWETdjsszH42-rzYE"],
+        25: ["CAACAgIAAxkBAAECaQVoxRgnf9Tl_egizv2IzRq-p4JDPgACWDEAAvTKMEpYpE1ML4rwgTYE"],
+        50: ["CgACAgQAAxkBAAECaQdoxRidErmqz3qB1miEt6Bf38ty2QACVwMAAolPBFMwDn_gBXkQejYE"],
+        75: ["CAACAgUAAxkBAAECaQ9oxRkWl7-xcGPLi-lwXgABsioAAbKwAAIzDgAC5j65V5cS4rkdBo1VNgQ"],
+        100: ["CAACAgIAAxkBAAECaRVoxRnUU7Q1SqXKZmqOZWSuAAHeGBMAAuENAAIxDJhKsojdm6OziV42BA"]
+    }
+    
+    @staticmethod
+    def calculate_xp_for_level(level: int) -> int:
+        """Calculate total XP needed for a specific level"""
+        if level <= 0:
+            return 0
+        elif level <= 10:
+            return level * 100
+        elif level <= 25:
+            return 1000 + (level - 10) * 250
+        elif level <= 50:
+            return 4750 + (level - 25) * 500
+        elif level <= 100:
+            return 17250 + (level - 50) * 1000
         else:
-            msg = await update.message.reply_text("Aisa koi item shop mein nahi hai. /shop dekho.")
-            asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    except Exception as e:
-        logger.error(f"Error in buy command: {e}")
-        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    finally:
-        session.close()
-
-async def rep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message.reply_to_message:
-        msg = await update.message.reply_text("Yeh command kisi message ko reply karke istemal karein.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-        return
-        
-    giver = update.effective_user
-    receiver = update.message.reply_to_message.from_user
+            return 67250 + (level - 100) * 2000
     
-    if giver.id == receiver.id:
-        msg = await update.message.reply_text("Aap khud ko reputation nahi de sakte!")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-        return
-        
-    session = Session()
-    try:
-        db_receiver = get_or_create_user(session, receiver)
-        db_receiver.reputation += 1
-        session.commit()
-        giver_mention = f"@{giver.username}" if giver.username else giver.first_name
-        receiver_mention = f"@{receiver.username}" if receiver.username else receiver.first_name
-        msg = await update.message.reply_to_message.reply_text(f"{receiver_mention} ki reputation {giver_mention} ne badhai! Current reputation: {db_receiver.reputation} 👍")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    except Exception as e:
-        logger.error(f"Error in rep command: {e}")
-        msg = await update.message.reply_text("Kuch error aaya hai. Thodi der baad try karo.")
-        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, msg.message_id))
-    finally:
-        session.close()
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+    @staticmethod
+    def calculate_level_from_xp(xp: int) -> int:
+        """Calculate level from total XP"""
+        level = 0
+        while xp >= LevelSystem.calculate_xp_for_level(level + 1):
+            level += 1
+        return level
     
-    if query.data == 'stats':
-        await stats_command_with_query(query, context)
-    elif query.data == 'shop':
-        await shop_command_with_query(query, context)
-    elif query.data == 'help':
-        await help_command_with_query(query, context)
-    elif query.data == 'premium':
-        await premium_command_with_query(query, context)
-    elif query.data == 'main_menu':
-        await start_command_with_query(query, context)
-
-async def stats_command_with_query(query, context):
-    session = Session()
-    try:
-        db_user = get_or_create_user(session, query.from_user)
+    @staticmethod
+    def get_progress_bar(current_xp: int, current_level: int) -> str:
+        """Generate visual progress bar"""
+        current_level_xp = LevelSystem.calculate_xp_for_level(current_level)
+        next_level_xp = LevelSystem.calculate_xp_for_level(current_level + 1)
         
-        req_for_next = get_level_requirements(db_user.level + 1)
-        messages_for_next = max(0, req_for_next - db_user.messages_count)
-        
-        # Create a visual progress bar
-        progress = (db_user.messages_count - get_level_requirements(db_user.level)) / (req_for_next - get_level_requirements(db_user.level)) * 100
+        progress = (current_xp - current_level_xp) / (next_level_xp - current_level_xp) * 100
         progress = max(0, min(100, progress))
-        progress_bar = "[" + "█" * int(progress / 5) + "░" * (20 - int(progress / 5)) + "]"
         
-        stats_text = (
-            f"📊 **{db_user.get_display_name()}'s Stats** 📊\n\n"
-            f"• **Level:** {db_user.level} (Prestige {db_user.prestige}🌟)\n"
-            f"• **Progress to next level:** {progress:.1f}%\n{progress_bar}\n"
-            f"• **Messages:** {db_user.messages_count}\n"
-            f"• **HubCoins:** {db_user.hubcoins} 💰\n"
-            f"• **Reputation:** {db_user.reputation} 👍\n"
-            f"• **Daily Streak:** {db_user.daily_streak or 0} days 🔥\n"
-            f"• **Next Level:** in {messages_for_next} messages.\n"
-            f"• **VIP Status:** {'Yes 🎖️' if db_user.vip_member else 'No'}\n"
-            f"• **Achievements:** {len(db_user.achievements.split(',')) if db_user.achievements else 0} 🏆"
+        filled = int(progress / 5)
+        empty = 20 - filled
+        
+        return f"[{'█' * filled}{'░' * empty}] {progress:.1f}%"
+    
+    @staticmethod
+    def get_level_title(level: int) -> str:
+        """Get title based on level"""
+        titles = {
+            0: "Newbie",
+            10: "Apprentice",
+            25: "Member",
+            50: "Veteran",
+            75: "Expert",
+            100: "Master",
+            150: "Grand Master",
+            200: "Legend"
+        }
+        
+        for min_level in sorted(titles.keys(), reverse=True):
+            if level >= min_level:
+                return titles[min_level]
+        
+        return "Newbie"
+
+# ==================== Message Handler ====================
+
+class MessageProcessor:
+    """Process and handle user messages"""
+    
+    def __init__(self, db_manager: DatabaseManager, cache_manager: CacheManager):
+        self.db = db_manager
+        self.cache = cache_manager
+        self.gemini_model = self._setup_gemini()
+    
+    def _setup_gemini(self):
+        """Setup Gemini AI model"""
+        try:
+            genai.configure(api_key=Config.GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            logger.info("Gemini AI configured successfully")
+            return model
+        except Exception as e:
+            logger.error(f"Failed to configure Gemini AI: {e}")
+            return None
+    
+    async def process_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process incoming message and update user stats"""
+        if not update.message or not update.message.from_user:
+            return
+        
+        if update.effective_chat.id != Config.GROUP_ID:
+            return
+        
+        user_id = update.effective_user.id
+        
+        # Check rate limiting
+        if not await self.cache.check_rate_limit(user_id):
+            logger.warning(f"User {user_id} rate limited")
+            return
+        
+        async with self.db.get_session() as session:
+            try:
+                # Get or create user
+                user = await self._get_or_create_user(session, update.effective_user)
+                
+                # Update user stats
+                old_level = user.level
+                user.messages_count += 1
+                user.last_message_date = datetime.utcnow()
+                user.last_active = datetime.utcnow()
+                
+                # Calculate XP gain
+                base_xp = random.randint(10, 25)
+                if user.boost_active and user.boost_expiry > datetime.utcnow():
+                    base_xp *= 2
+                
+                user.xp += base_xp
+                user.total_xp_earned += base_xp
+                
+                # Calculate coins gain
+                base_coins = random.randint(1, 5)
+                if user.vip_member and (not user.vip_expiry or user.vip_expiry > datetime.utcnow()):
+                    base_coins *= 2
+                
+                user.hubcoins += base_coins
+                user.total_coins_earned += base_coins
+                
+                # Check for level up
+                new_level = LevelSystem.calculate_level_from_xp(user.xp)
+                level_up_occurred = new_level > old_level
+                
+                if level_up_occurred:
+                    user.level = new_level
+                    # Bonus rewards for leveling up
+                    level_bonus = new_level * 50
+                    user.hubcoins += level_bonus
+                    user.total_coins_earned += level_bonus
+                    
+                    # Send level up message
+                    await self._send_level_up_message(update, context, user, new_level)
+                
+                # Check achievements
+                earned_achievements = await AchievementManager.check_all_achievements(user)
+                if earned_achievements:
+                    await self._notify_achievements(update, context, earned_achievements)
+                
+                # Update cache
+                await self.cache.set_user(user_id, user.to_dict())
+                
+                # Auto-delete message after delay
+                asyncio.create_task(
+                    self._delete_message_after_delay(
+                        context.bot,
+                        update.effective_chat.id,
+                        update.message.message_id
+                    )
+                )
+                
+            except Exception as e:
+                logger.error(f"Error processing message from user {user_id}: {e}")
+    
+    async def _get_or_create_user(self, session, telegram_user):
+        """Get or create user in database"""
+        user = await asyncio.to_thread(
+            session.query(User).filter(User.user_id == telegram_user.id).first
         )
         
+        if not user:
+            user = User(
+                user_id=telegram_user.id,
+                username=telegram_user.username,
+                first_name=telegram_user.first_name or "User"
+            )
+            session.add(user)
+            logger.info(f"Created new user: {telegram_user.id}")
+        
+        return user
+    
+    async def _send_level_up_message(self, update, context, user, level):
+        """Send level up notification"""
+        user_mention = f"@{user.username}" if user.username else user.first_name
+        
+        # Generate message using AI or fallback
+        if self.gemini_model:
+            try:
+                prompt = f"Write a very short (max 2 lines) congratulations message for {user_mention} reaching Level {level}. Be enthusiastic and use emojis."
+                response = await asyncio.to_thread(
+                    self.gemini_model.generate_content,
+                    prompt
+                )
+                message = response.text.strip()
+            except Exception as e:
+                logger.error(f"Gemini error: {e}")
+                message = f"🎉 GG {user_mention}! Level {level} achieved! Keep grinding! 🚀"
+        else:
+            messages = [
+                f"🎉 {user_mention} just hit Level {level}! Absolute legend! 🔥",
+                f"⚡ Level {level} unlocked! {user_mention} is on fire! 🚀",
+                f"👑 {user_mention} reached Level {level}! Built different! 💪",
+                f"🌟 Big W! {user_mention} is now Level {level}! 🎊",
+            ]
+            message = random.choice(messages)
+        
+        msg = await update.message.reply_text(message)
+        
+        # Send sticker if available for this level
+        if level in LevelSystem.LEVEL_STICKERS:
+            sticker_id = random.choice(LevelSystem.LEVEL_STICKERS[level])
+            sticker_msg = await update.message.reply_sticker(sticker_id)
+            asyncio.create_task(
+                self._delete_message_after_delay(
+                    context.bot,
+                    update.effective_chat.id,
+                    sticker_msg.message_id
+                )
+            )
+        
+        asyncio.create_task(
+            self._delete_message_after_delay(
+                context.bot,
+                update.effective_chat.id,
+                msg.message_id
+            )
+        )
+    
+    async def _notify_achievements(self, update, context, achievements):
+        """Notify user about earned achievements"""
+        for achievement in achievements:
+            message = (
+                f"🏆 **Achievement Unlocked!**\n"
+                f"{achievement['icon']} {achievement['name']}\n"
+                f"_{achievement['description']}_\n"
+                f"Reward: {achievement['reward']} coins"
+            )
+            msg = await update.message.reply_text(
+                message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            asyncio.create_task(
+                self._delete_message_after_delay(
+                    context.bot,
+                    update.effective_chat.id,
+                    msg.message_id,
+                    delay=30
+                )
+            )
+    
+    async def _delete_message_after_delay(self, bot, chat_id, message_id, delay=None):
+        """Delete message after specified delay"""
+        if delay is None:
+            delay = Config.MESSAGE_DELETE_DELAY
+        
+        await asyncio.sleep(delay)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.debug(f"Deleted message {message_id}")
+        except BadRequest as e:
+            if "Message to delete not found" not in str(e):
+                logger.error(f"Error deleting message {message_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error deleting message {message_id}: {e}")
+
+# ==================== Command Handlers ====================
+
+class CommandHandlers:
+    """All bot command handlers"""
+    
+    def __init__(self, db_manager: DatabaseManager, cache_manager: CacheManager):
+        self.db = db_manager
+        self.cache = cache_manager
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
         keyboard = [
-            [InlineKeyboardButton("« Back", callback_data='main_menu')]
+            [
+                InlineKeyboardButton("📊 Stats", callback_data='stats'),
+                InlineKeyboardButton("🛍️ Shop", callback_data='shop')
+            ],
+            [
+                InlineKeyboardButton("🏆 Leaderboard", callback_data='leaderboard'),
+                InlineKeyboardButton("🎯 Achievements", callback_data='achievements')
+            ],
+            [
+                InlineKeyboardButton("⚙️ Settings", callback_data='settings'),
+                InlineKeyboardButton("ℹ️ Help", callback_data='help')
+            ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(stats_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Error in stats command: {e}")
-        await query.edit_message_text("Kuch error aaya hai. Thodi der baad try karo.")
-    finally:
-        session.close()
-
-async def shop_command_with_query(query, context):
-    shop_text = (
-        "🛒 **ThePromotionHub Shop** 🛒\n\n"
-        "Apne HubCoins se yeh items khareedo:\n\n"
-        "1. **Title** (1000 Coins) - Ek hafte ke liye custom title.\n"
-        "   `/buy title [Your Title]`\n\n"
-        "2. **Spotlight** (2500 Coins) - Agle din ke spotlight mein guaranteed jagah.\n"
-        "   `/buy spotlight`\n\n"
-        "3. **VIP** (10000 Coins) - Permanent VIP status aur special perks.\n"
-        "   `/buy vip`\n\n"
-        "4. **Name Color** (1500 Coins) - Apne naam ka color change karo.\n"
-        "   `/buy color [color]`\n\n"
-        "5. **Daily Boost** (500 Coins) - Agle 24 hours ke liye 2x coins milein.\n"
-        "   `/buy boost`"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("« Back", callback_data='main_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(shop_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-
-async def help_command_with_query(query, context):
-    help_text = (
-        "📜 **LevelUp Leo Commands** 📜\n\n"
-        "`/stats` - Apni level, coins aur progress dekho.\n"
-        "`/coins` - Apne HubCoins ka balance dekho.\n"
-        "`/shop` - Dekho ki tum HubCoins se kya khareed sakte ho.\n"
-        "`/buy [item]` - Shop se kuch khareedo (e.g., `/buy title`)\n"
-        "`/prestige` - Level 100 ke baad special badge ke liye level reset karo.\n"
-        "`/daily` - Roz ka reward claim karo.\n"
-        "Reply to a message with `/rep` to give reputation to a user."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("« Back", callback_data='main_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-
-async def premium_command_with_query(query, context):
-    premium_text = (
-        "🌟 **LevelUp Leo Premium** 🌟\n\n"
-        "Premium features ke liye abhi available nahi hain, lekin jald hi aane wale hain!\n\n"
-        "Interested hain? @ThePromotionHub ko contact karein."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("« Back", callback_data='main_menu')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(premium_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-
-async def start_command_with_query(query, context):
-    keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data='stats'),
-         InlineKeyboardButton("🛒 Shop", callback_data='shop')],
-        [InlineKeyboardButton("🌟 Premium", callback_data='premium'),
-         InlineKeyboardButton("❓ Help", callback_data='help')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "Namaste! Main LevelUp Leo hoon. Group mein message karke apni level badhao!",
-        reply_markup=reply_markup
-    )
-
-# 5. Scheduled Jobs
-async def spotlight_feature(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Running daily spotlight job...")
-    session = Session()
-    try:
-        # Prioritize users who bought the spotlight
-        priority_user = session.query(User).filter(User.spotlight_priority == True).order_by(func.random()).first()
-        
-        if priority_user:
-            selected_user = priority_user
-            selected_user.spotlight_priority = False # Reset after use
-            logger.info(f"Spotlight priority user found: {selected_user.first_name}")
-        else:
-            # Select a random active user from the last 7 days
-            one_week_ago = datetime.now() - timedelta(days=7)
-            active_users = session.query(User).filter(User.last_message_date >= one_week_ago).all()
-            if not active_users: 
-                logger.info("No active users found for spotlight.")
-                return
-            selected_user = random.choice(active_users)
-            logger.info(f"Spotlight random user found: {selected_user.first_name}")
-        
-        user_mention = f"@{selected_user.username}" if selected_user.username else selected_user.first_name
-        spotlight_text = (
-            f"🌟 **Spotlight of the Day: {selected_user.get_display_name()}!** 🌟\n\n"
-            f"{selected_user.get_display_name()} has been super active in our community (Level: {selected_user.level}).\n\n"
-            f"Let's show some love today—check out their content and drop your feedback! 🚀"
+        welcome_text = (
+            "🎮 **Welcome to LevelUp Leo!** 🎮\n\n"
+            "Level up by chatting in the group!\n"
+            "Earn coins, unlock achievements, and become a legend!\n\n"
+            "Choose an option below to get started:"
         )
         
-        msg = await context.bot.send_message(chat_id=GROUP_ID, text=spotlight_text, parse_mode=ParseMode.MARKDOWN)
-        asyncio.create_task(delete_message_after_delay(context.bot, GROUP_ID, msg.message_id, 3600))  # Delete after 1 hour
-        session.commit()
-    except Exception as e:
-        logger.error(f"Spotlight Error: {e}")
-    finally:
-        session.close()
-
-# Database cleanup job
-async def cleanup_expired_titles(context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Running cleanup job for expired titles...")
-    session = Session()
-    try:
-        expired_users = session.query(User).filter(
-            User.custom_title_expiry.isnot(None),
-            User.custom_title_expiry < datetime.now()
-        ).all()
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user statistics"""
+        user_id = update.effective_user.id
         
-        for user in expired_users:
-            user.custom_title = ""
-            user.custom_title_expiry = None
-            logger.info(f"Cleared expired title for user {user.user_id}")
+        # Try cache first
+        cached_user = await self.cache.get_user(user_id)
         
-        session.commit()
-        logger.info(f"Cleared {len(expired_users)} expired titles")
-    except Exception as e:
-        logger.error(f"Cleanup Error: {e}")
-    finally:
-        session.close()
-
-# Network error handling
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling an update: {context.error}")
+        async with self.db.get_session() as session:
+            user = await asyncio.to_thread(
+                session.query(User).filter(User.user_id == user_id).first
+            )
+            
+            if not user:
+                await update.message.reply_text("You haven't started yet! Send a message in the group first.")
+                return
+            
+            # Generate stats message
+            progress_bar = LevelSystem.get_progress_bar(user.xp, user.level)
+            level_title = LevelSystem.get_level_title(user.level)
+            
+            stats_text = (
+                f"📊 **{user.get_display_name()}'s Stats**\n"
+                f"━━━━━━━━━━━━━━━━━\n\n"
+                f"**Rank:** {level_title}\n"
+                f"**Level:** {user.level} {'⭐' * min(user.prestige, 5)}\n"
+                f"**XP:** {user.xp:,} / {LevelSystem.calculate_xp_for_level(user.level + 1):,}\n"
+                f"**Progress:** {progress_bar}\n\n"
+                f"**💰 Coins:** {user.hubcoins:,}\n"
+                f"**💬 Messages:** {user.messages_count:,}\n"
+                f"**👍 Reputation:** {user.reputation:,}\n"
+                f"**🔥 Daily Streak:** {user.daily_streak or 0} days\n"
+                f"**🏆 Achievements:** {len(user.achievements or {})}\n\n"
+                f"**Status:**\n"
+            )
+            
+            # Add status badges
+            if user.vip_member and (not user.vip_expiry or user.vip_expiry > datetime.utcnow()):
+                stats_text += "• 👑 VIP Member\n"
+            if user.boost_active and user.boost_expiry > datetime.utcnow():
+                stats_text += "• ⚡ XP Boost Active\n"
+            if user.custom_title and (not user.custom_title_expiry or user.custom_title_expiry > datetime.utcnow()):
+                stats_text += f"• 🏷️ Title: {user.custom_title}\n"
+            
+            await update.message.reply_text(
+                stats_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
     
-    # Check if it's a network error
-    if "network" in str(context.error).lower() or "connection" in str(context.error).lower():
-        logger.warning("Network error detected, waiting before retrying...")
-        await asyncio.sleep(5)  # Wait before retrying
-
-# Health check endpoint for Render
-from aiohttp import web
-
-async def health_check(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"Web server started on port {PORT}")
-
-# -*- coding: utf-8 -*-
-# LevelUp Leo Bot - Fixed Main Function
-
-# ... (पिछला सारा code exactly वैसा ही रखें)
-
-# --- Main Application ---
-async def main() -> None:
-    # Create the Telegram bot application with connection pooling
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .pool_timeout(30)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
+    async def daily(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Claim daily reward"""
+        user_id = update.effective_user.id
+        
+        async with self.db.get_session() as session:
+            user = await asyncio.to_thread(
+                session.query(User).filter(User.user_id == user_id).first
+            )
+            
+            if not user:
+                await update.message.reply_text("You need to send a message in the group first!")
+                return
+            
+            today = datetime.utcnow().date()
+            last_daily = user.last_daily_date.date() if user.last_daily_date else None
+            
+            if last_daily == today:
+                time_until_reset = datetime.combine(
+                    today + timedelta(days=1),
+                    datetime.min.time()
+                ) - datetime.utcnow()
+                hours = int(time_until_reset.total_seconds() // 3600)
+                minutes = int((time_until_reset.total_seconds() % 3600) // 60)
+                
+                await update.message.reply_text(
+                    f"⏰ Daily reward already claimed!\n"
+                    f"Come back in {hours}h {minutes}m"
+                )
+                return
+            
+            # Calculate streak
+            if last_daily and (today - last_daily).days == 1:
+                user.daily_streak = (user.daily_streak or 0) + 1
+            else:
+                user.daily_streak = 1
+            
+            # Calculate rewards
+            base_reward = 100
+            streak_bonus = min(500, user.daily_streak * 10)
+            vip_bonus = 100 if user.vip_member else 0
+            total_reward = base_reward + streak_bonus + vip_bonus
+            
+            # Award rewards
+            user.hubcoins += total_reward
+            user.total_coins_earned += total_reward
+            user.last_daily_date = datetime.utcnow()
+            
+            # Check streak achievements
+            await AchievementManager.check_all_achievements(user)
+            
+            await update.message.reply_text(
+                f"🎁 **Daily Reward Claimed!**\n\n"
+                f"Base reward: {base_reward} coins\n"
+                f"Streak bonus (Day {user.daily_streak}): {streak_bonus} coins\n"
+                f"{f'VIP bonus: {vip_bonus} coins' if vip_bonus else ''}\n"
+                f"**Total: {total_reward} coins**\n\n"
+                f"🔥 Current streak: {user.daily_streak} days"
+            )
     
-    # Add error handler
-    application.add_error_handler(error_handler)
+    async def shop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display shop with items"""
+        shop_text = (
+            "🛍️ **LevelUp Shop**\n"
+            "━━━━━━━━━━━━━━━━━\n\n"
+            "**Available Items:**\n\n"
+            "**1. 🏷️ Custom Title** - 1,000 coins\n"
+            "   `/buy title [Your Title]`\n"
+            "   _Display a custom title for 7 days_\n\n"
+            "**2. ⚡ XP Boost** - 500 coins\n"
+            "   `/buy boost`\n"
+            "   _Double XP for 24 hours_\n\n"
+            "**3. 🌟 Spotlight Priority** - 2,500 coins\n"
+            "   `/buy spotlight`\n"
+            "   _Guaranteed spotlight feature_\n\n"
+            "**4. 👑 VIP Status** - 10,000 coins\n"
+            "   `/buy vip`\n"
+            "   _30 days of VIP benefits_\n\n"
+            "**5. 🎲 Mystery Box** - 1,000 coins\n"
+            "   `/buy mystery`\n"
+            "   _Random rewards!_\n\n"
+            "**6. 🔄 Name Change** - 500 coins\n"
+            "   `/buy namechange [New Name]`\n"
+            "   _Change your display name_"
+        )
+        
+        await update.message.reply_text(
+            shop_text,
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    # Add all command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("prestige", prestige_command))
-    application.add_handler(CommandHandler("shop", shop_command))
-    application.add_handler(CommandHandler("buy", buy_command))
-    application.add_handler(CommandHandler("coins", stats_command))
-    application.add_handler(CommandHandler("rep", rep_command))
-    application.add_handler(CommandHandler("daily", daily_command))
-
-    # Add callback query handler for inline buttons
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    # Add message handler for leveling up
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    async def buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle shop purchases"""
+        if not context.args:
+            await update.message.reply_text("Usage: `/buy [item] [options]`")
+            return
+        
+        item = context.args.lower()
+        user_id = update.effective_user.id
+        
+        async with self.db.get_session() as session:
+            user = await asyncio.to_thread(
+                session.query(User).filter(User.user_id == user_id).first
+            )
+            
+            if not user:
+                await update.message.reply_text("You need to send a message in the group first!")
+                return
+            
+            # Process different items
+            if item == "title":
+                await self._buy_title(update, context, user, session)
+            elif item == "boost":
+                await self._buy_boost(update, context, user, session)
+            elif item == "spotlight":
+                await self._buy_spotlight(update, context, user, session)
+            elif item == "vip":
+                await self._buy_vip(update, context, user, session)
+            elif item == "mystery":
+                await self._buy_mystery(update, context, user, session)
+            elif item == "namechange":
+                await self._buy_namechange(update, context, user, session)
+            else:
+                await update.message.reply_text("❌ Unknown item! Check `/shop` for available items.")
     
-    # Add handler for new members
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    async def _buy_title(self, update, context, user, session):
+        """Purchase custom title"""
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/buy title [Your Title]`")
+            return
+        
+        title = " ".join(context.args[1:])
+        is_valid, clean_title = InputValidator.validate_title(title)
+        
+        if not is_valid:
+            await update.message.reply_text(f"❌ {clean_title}")  # clean_title contains error message
+            return
+        
+        if user.hubcoins < 1000:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 1,000 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 1000
+        user.total_coins_spent += 1000
+        user.custom_title = clean_title
+        user.custom_title_expiry = datetime.utcnow() + timedelta(days=7)
+        
+        await update.message.reply_text(
+            f"✅ **Title Purchased!**\n"
+            f"Your new title: [{clean_title}]\n"
+            f"Valid for 7 days\n"
+            f"Remaining coins: {user.hubcoins}"
+        )
     
-    # Add job queue for scheduled tasks
-    job_queue = application.job_queue
-    # Run spotlight every 24 hours
-    job_queue.run_repeating(spotlight_feature, interval=timedelta(hours=24), first=10)
-    # Run cleanup every 6 hours
-    job_queue.run_repeating(cleanup_expired_titles, interval=timedelta(hours=6), first=10)
-
-    logger.info("Starting bot...")
+    async def _buy_boost(self, update, context, user, session):
+        """Purchase XP boost"""
+        if user.hubcoins < 500:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 500 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 500
+        user.total_coins_spent += 500
+        user.boost_active = True
+        user.boost_expiry = datetime.utcnow() + timedelta(hours=24)
+        
+        await update.message.reply_text(
+            f"⚡ **XP Boost Activated!**\n"
+            f"You'll earn 2x XP for the next 24 hours!\n"
+            f"Remaining coins: {user.hubcoins}"
+        )
     
-    # Start web server for health checks
-    asyncio.create_task(start_web_server())
+    async def _buy_vip(self, update, context, user, session):
+        """Purchase VIP status"""
+        if user.hubcoins < 10000:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 10,000 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 10000
+        user.total_coins_spent += 10000
+        user.vip_member = True
+        user.vip_expiry = datetime.utcnow() + timedelta(days=30)
+        
+        # Award VIP achievement
+        achievement = await AchievementManager.check_and_award(user, 'vip')
+        
+        await update.message.reply_text(
+            f"👑 **Welcome to VIP!**\n\n"
+            f"Benefits:\n"
+            f"• 2x coins from messages\n"
+            f"• Exclusive VIP badge\n"
+            f"• Daily bonus boost\n"
+            f"• Priority support\n\n"
+            f"Valid for 30 days\n"
+            f"Remaining coins: {user.hubcoins}"
+        )
     
-    # Start the bot
-    await application.run_polling(
-        poll_interval=1.0,
-        timeout=30,
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
-
-if __name__ == '__main__':
-    # Run the main function
-    asyncio.run(main())
+    async def _buy_mystery(self, update, context, user, session):
+        """Purchase mystery box with random rewards"""
+        if user.hubcoins < 1000:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 1,000 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 1000
+        user.total_coins_spent += 1000
+        
+        # Random rewards
+        rewards = []
+        
+        # Coins (70% chance)
+        if random.random() < 0.7:
+            coin_reward = random.choice([500, 750, 1000, 1500, 2000, 5000])
+            user.hubcoins += coin_reward
+            user.total_coins_earned += coin_reward
+            rewards.append(f"💰 {coin_reward} coins")
+        
+        # XP (50% chance)
+        if random.random() < 0.5:
+            xp_reward = random.randint(100, 500)
+            user.xp += xp_reward
+            user.total_xp_earned += xp_reward
+            rewards.append(f"⭐ {xp_reward} XP")
+        
+        # Temporary boost (20% chance)
+        if random.random() < 0.2:
+            user.boost_active = True
+            user.boost_expiry = datetime.utcnow() + timedelta(hours=12)
+            rewards.append("⚡ 12-hour XP boost")
+        
+        # Reputation (30% chance)
+        if random.random() < 0.3:
+            rep_reward = random.randint(5, 20)
+            user.reputation += rep_reward
+            rewards.append(f"👍 {rep_reward} reputation")
+        
+        if not rewards:
+            # Guarantee at least something
+            user.hubcoins += 500
+            rewards.append("💰 500 coins (consolation prize)")
+        
+        await update.message.reply_text(
+            f"🎲 **Mystery Box Opened!**\n\n"
+            f"You received:\n" + "\n".join(f"• {reward}" for reward in rewards) +
+            f"\n\nRemaining coins: {user.hubcoins}"
+        )
+    
+    async def _buy_spotlight(self, update, context, user, session):
+        """Purchase spotlight priority"""
+        if user.hubcoins < 2500:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 2,500 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 2500
+        user.total_coins_spent += 2500
+        user.spotlight_priority = True
+        
+        await update.message.reply_text(
+            f"🌟 **Spotlight Priority Purchased!**\n"
+            f"You'll be featured in the next spotlight!\n"
+            f"Remaining coins: {user.hubcoins}"
+        )
+    
+    async def _buy_namechange(self, update, context, user, session):
+        """Change display name"""
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/buy namechange [New Name]`")
+            return
+        
+        new_name = " ".join(context.args[1:])[:50]  # Max 50 chars
+        
+        if user.hubcoins < 500:
+            await update.message.reply_text(
+                f"❌ Insufficient coins! You need 500 coins.\n"
+                f"Your balance: {user.hubcoins} coins"
+            )
+            return
+        
+        user.hubcoins -= 500
+        user.total_coins_spent += 500
+        user.first_name = new_name
+        
+        await update.message.reply_text(
+            f"✅ **Name Changed!**\n"
+            f"Your new name: {new_name}\n"
+            f"Remaining coins: {user.hubcoins}"
+        )
+    
+    async def prestige(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle prestige system"""
+        user_id = update.effective_user.id
+        
+        async with self.db.get_session() as session:
+            user = await asyncio.to_thread(
+                session.query(User).filter(User.user_id == user_id).first
+            )
+            
+            if not user:
+                await update.message.reply_text("You need to send a message in the group first!")
+                return
+            
+            if user.level < 100:
+                await update.message.reply_text(
+                    f"❌ You need to reach Level 100 to prestige!\n"
+                    f"Current level: {user.level}"
+                )
+                return
+            
+            # Confirm prestige
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm Prestige", callback_data=f"prestige_confirm_{user_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="prestige_cancel")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            prestige_rewards = 1000 * (user.prestige + 1)
+            
+            await update.message.reply_text(
+                f"⚠️ **Prestige Confirmation**\n\n"
+                f"Are you sure you want to prestige?\n\n"
+                f"**You will lose:**\n"
+                f"• Your current level (back to 1)\n"
+                f"• Your current XP\n\n"
+                f"**You will gain:**\n"
+                f"• Prestige level {user.prestige + 1} ⭐\n"
+                f"• {prestige_rewards} coins\n"
+                f"• Permanent prestige badge\n"
+                f"• Increased rewards multiplier",
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    async def leaderboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show server leaderboard"""
+        async with self.db.get_session() as session:
+            # Get top users by level
+            top_by_level = await asyncio.to_thread(
+                lambda: session.query(User)
+                .order_by(User.prestige.desc(), User.level.desc(), User.xp.desc())
+                .limit(10)
+                .all()
+            )
+            
+            # Get top users by coins
+            top_by_coins = await asyncio.to_thread(
+                lambda: session.query(User)
+                .order_by(User.hubcoins.desc())
+                .limit(5)
+                .all()
+            )
+            
+            # Format leaderboard
+            leaderboard_text = "🏆 **Server Leaderboard**\n"
+            leaderboard_text += "━━━━━━━━━━━━━━━━━\n\n"
+            leaderboard_text += "**Top Players by Level:**\n"
+            
+            medals = ["🥇", "🥈", "🥉"]
+            
+            for i, user in enumerate(top_by_level, 1):
+                medal = medals[i-1] if i <= 3 else f"{i}."
+                prestige_stars = "⭐" * min(user.prestige, 5) if user.prestige > 0 else ""
+                leaderboard_text += f"{medal} {user.first_name[:20]} - Lvl {user.level} {prestige_stars}\n"
+            
+            leaderboard_text += "\n**Richest Players:**\n"
+            
+            for i, user in enumerate(top_by_coins, 1):
+                medal = medals[i-1] if i <= 3 else f"{i}."
+                le
+                
