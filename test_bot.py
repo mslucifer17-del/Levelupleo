@@ -3,7 +3,7 @@ import json
 
 def test_bot():
     """Test if bot is responding"""
-    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual token
+    BOT_TOKEN = "8409424851:AAHkLsnj1ZdwKehAEDmT8swYHTTRAu2BB1Y"  # Replace with your actual token
     
     # Get bot info
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
