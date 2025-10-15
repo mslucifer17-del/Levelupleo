@@ -1,9 +1,9 @@
-# FIXED BOT.PY FILE - EVENT LOOP ISSUES RESOLVED
+# COMPLETELY FIXED BOT.PY - NO EVENT LOOP ISSUES
 
 import os
 import asyncio
 import random
-import signal
+import logging
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -12,6 +12,13 @@ from level_system import LevelSystem
 from economy import EconomySystem
 from gemini_handler import GeminiHandler
 import config
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 class LevelupLeoBot:
     def __init__(self):
@@ -315,65 +322,54 @@ class LevelupLeoBot:
         elif query.data.startswith("shop_"):
             await self.process_shop_purchase(query, context)
 
+async def initialize_database():
+    """Initialize database separately"""
+    db = Database()
+    await db.create_pool()
+    await db.setup_tables()
+    return db
+
 def main():
-    """Initialize and run the bot - FIXED VERSION"""
-    # Create bot instance
-    bot = LevelupLeoBot()
+    """Main function - SIMPLE AND WORKING VERSION"""
+    print("Starting Levelup Leo Bot...")
     
-    # Create application
-    application = Application.builder().token(config.BOT_TOKEN).build()
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("level", bot.level_command))
-    application.add_handler(CommandHandler("top", bot.top_command))
-    application.add_handler(CommandHandler("shop", bot.shop_command))
-    application.add_handler(CommandHandler("balance", bot.balance_command))
-    application.add_handler(CommandHandler("help", bot.help_command))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.on_new_member))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    application.add_handler(CallbackQueryHandler(bot.handle_callback))
-
-    # Start the bot
-    print("Bot is now running and polling for updates...")
+    # Create event loop and initialize database
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Run the bot until Ctrl-C is pressed
-    application.run_polling()
+    try:
+        # Initialize database
+        print("Initializing database...")
+        db = loop.run_until_complete(initialize_database())
+        print("Database initialized successfully!")
+        
+        # Create bot instance
+        bot = LevelupLeoBot()
+        bot.db = db  # Use the initialized database
+        bot.economy = EconomySystem(db)  # Reinitialize economy with the db
+        
+        # Build application
+        application = Application.builder().token(config.BOT_TOKEN).build()
 
-async def async_main():
-    """Async version for proper database initialization"""
-    bot = LevelupLeoBot()
-    
-    # Initialize database
-    await bot.db.create_pool()
-    await bot.db.setup_tables()
-    print("Database initialized successfully!")
-    
-    # Create application
-    application = Application.builder().token(config.BOT_TOKEN).build()
+        # Add handlers
+        application.add_handler(CommandHandler("start", bot.start))
+        application.add_handler(CommandHandler("level", bot.level_command))
+        application.add_handler(CommandHandler("top", bot.top_command))
+        application.add_handler(CommandHandler("shop", bot.shop_command))
+        application.add_handler(CommandHandler("balance", bot.balance_command))
+        application.add_handler(CommandHandler("help", bot.help_command))
+        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.on_new_member))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+        application.add_handler(CallbackQueryHandler(bot.handle_callback))
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("level", bot.level_command))
-    application.add_handler(CommandHandler("top", bot.top_command))
-    application.add_handler(CommandHandler("shop", bot.shop_command))
-    application.add_handler(CommandHandler("balance", bot.balance_command))
-    application.add_handler(CommandHandler("help", bot.help_command))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.on_new_member))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    application.add_handler(CallbackQueryHandler(bot.handle_callback))
-
-    # Start the bot
-    print("Bot is now running and polling for updates...")
-    
-    # Run the bot
-    await application.run_polling()
+        # Start the bot
+        print("Bot is now running and polling for updates...")
+        application.run_polling()
+        
+    except Exception as e:
+        print(f"Error starting bot: {e}")
+    finally:
+        loop.close()
 
 if __name__ == '__main__':
-    try:
-        # Use the async version for proper database initialization
-        asyncio.run(async_main())
-    except KeyboardInterrupt:
-        print("Bot stopped manually.")
-    except Exception as e:
-        print(f"Error: {e}")
+    main()
