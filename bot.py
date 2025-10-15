@@ -1,6 +1,6 @@
 """
-LevelUp Leo Bot - Production Ready Version
-Fixed for Render deployment with proper error handling
+LevelUp Leo Bot - Fixed Event Loop Version
+Production ready with proper asyncio handling
 """
 
 import os
@@ -9,11 +9,9 @@ import asyncio
 import logging
 import random
 import time
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from enum import Enum
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Any, Union
 from contextlib import asynccontextmanager
 
 import aiohttp
@@ -58,9 +56,8 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> "BotConfig":
         """Create config from environment variables with validation"""
-        # Required vars for basic functionality
         bot_token = os.environ.get('BOT_TOKEN')
-        gemini_api_key = os.environ.get('GEMINI_API_KEY', 'dummy_key')  # Optional
+        gemini_api_key = os.environ.get('GEMINI_API_KEY', 'dummy_key')
         group_id = os.environ.get('GROUP_ID')
         
         if not bot_token:
@@ -73,10 +70,8 @@ class BotConfig:
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
-        # For internal Render database URLs, use the correct format
+        # For internal Render database URLs
         if 'dpg-' in database_url and '-a' in database_url:
-            # This is likely an internal Render database hostname
-            # Try to use the external URL if available
             database_url_external = os.environ.get('DATABASE_URL_EXTERNAL', database_url)
             if database_url_external != database_url:
                 database_url = database_url_external
@@ -103,7 +98,7 @@ class BotLogger:
     def setup(config: BotConfig) -> logging.Logger:
         """Setup structured logging with proper formatting"""
         log_format = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
@@ -111,7 +106,7 @@ class BotLogger:
         file_handler = logging.FileHandler("bot.log", encoding='utf-8')
         file_handler.setFormatter(log_format)
         
-        # Console handler
+        # Console handler  
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(log_format)
         
@@ -169,7 +164,7 @@ class UserModel(Base):
         vip_badge = ' 👑' if self.vip_member else ''
         return f"{self.first_name}{title}{prestige_badge}{vip_badge}"
 
-# ==================== In-Memory Storage Fallback ====================
+# ==================== In-Memory Storage ====================
 
 class InMemoryUserStore:
     """In-memory storage as fallback when database is unavailable"""
@@ -215,10 +210,6 @@ class InMemoryUserStore:
             self.users[user_id].update(updates)
             return True
         return False
-    
-    def get_all_users(self) -> List[Dict[str, Any]]:
-        """Get all users from memory store"""
-        return list(self.users.values())
 
 # ==================== Database Manager ====================
 
@@ -247,21 +238,19 @@ class DatabaseManager:
                 
                 # Configure connection based on database type
                 if 'postgresql' in self.config.database_url or 'postgres' in self.config.database_url:
-                    # PostgreSQL configuration
                     pool_class = QueuePool
                     pool_args = {
                         'pool_size': 5,
                         'max_overflow': 10,
                         'pool_timeout': 30,
                         'pool_recycle': 1800,
-                        'pool_pre_ping': True,  # Enable connection health checks
+                        'pool_pre_ping': True,
                     }
                     connect_args = {
                         'connect_timeout': 10,
-                        'options': '-c statement_timeout=30000'  # 30 second statement timeout
+                        'options': '-c statement_timeout=30000'
                     }
                 else:
-                    # SQLite configuration
                     pool_class = NullPool
                     pool_args = {}
                     connect_args = {'check_same_thread': False}
@@ -271,7 +260,7 @@ class DatabaseManager:
                     self.config.database_url,
                     poolclass=pool_class,
                     connect_args=connect_args,
-                    echo=False,  # Set to True for debugging
+                    echo=False,
                     **pool_args
                 )
                 
@@ -293,9 +282,9 @@ class DatabaseManager:
                 self.logger.error(f"Database connection attempt {attempt + 1} failed: {e}")
                 
                 if attempt < self.config.max_retries - 1:
-                    delay = self.config.retry_delay * (2 ** attempt)  # Exponential backoff
+                    delay = self.config.retry_delay * (2 ** attempt)
                     self.logger.info(f"Waiting {delay} seconds before retry...")
-                    time.sleep(delay)  # Use blocking sleep here since we're in __init__
+                    time.sleep(delay)
                 else:
                     self.logger.error("Failed to connect to database after all retries")
                     self.logger.warning("Falling back to in-memory storage")
@@ -318,12 +307,6 @@ class DatabaseManager:
                 raise
             finally:
                 await asyncio.to_thread(session.close)
-    
-    def get_sync_session(self):
-        """Get synchronous database session for initialization"""
-        if self.use_memory:
-            return None
-        return self.session_factory()
 
 # ==================== User Service ====================
 
@@ -350,7 +333,6 @@ class UserService:
         # Use database
         async with self.db.get_session() as session:
             if session is None:
-                # Fallback to in-memory if session is None
                 return await self.get_or_create_user(user_data)
             
             user = await asyncio.to_thread(
@@ -373,7 +355,6 @@ class UserService:
     async def update_user_activity(self, user_id: int) -> Optional[int]:
         """Update user activity and check for level up"""
         if self.db.use_memory:
-            # Handle in-memory updates
             user = self.db.in_memory_store.get_user(user_id)
             if not user:
                 return None
@@ -383,7 +364,6 @@ class UserService:
             user['hubcoins'] += random.randint(1, 3)
             user['experience_points'] += random.randint(5, 15)
             
-            # Check for level up
             old_level = user['level']
             new_level = self.calculate_level(user['experience_points'])
             
@@ -413,7 +393,6 @@ class UserService:
             user.hubcoins += random.randint(1, 3)
             user.experience_points += random.randint(5, 15)
             
-            # Check for level up
             old_level = user.level
             new_level = self.calculate_level(user.experience_points)
             
@@ -481,7 +460,10 @@ class StatsCommandHandler:
             # Calculate progress
             next_level_exp = (level + 1) ** 2 * 50
             current_level_exp = level ** 2 * 50
-            progress = ((experience - current_level_exp) / (next_level_exp - current_level_exp) * 100)
+            if next_level_exp > current_level_exp:
+                progress = ((experience - current_level_exp) / (next_level_exp - current_level_exp) * 100)
+            else:
+                progress = 100
             progress = max(0, min(100, progress))
             
             # Create progress bar
@@ -562,6 +544,10 @@ class LevelUpBot:
             # Initialize handlers
             self._initialize_handlers()
             
+            # Initialize web server
+            self.web_app = None
+            self.web_runner = None
+            
             self.logger.info("Bot initialization complete")
             
         except Exception as e:
@@ -638,46 +624,48 @@ class LevelUpBot:
         """Handle errors in the bot"""
         self.logger.error(f"Exception while handling update: {context.error}", exc_info=True)
     
-    # In bot.py, inside the LevelUpBot class
-# Replace the ENTIRE 'run' method with this new version:
-async def run(self) -> None:
-    """Run the bot and health check server concurrently without conflict."""
-    application = (
-        Application.builder()
-        .token(self.config.bot_token)
-        .pool_timeout(30)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
-
-    # Add handlers
-    application.add_error_handler(self.error_handler)
-    application.add_handler(
-        CommandHandler("stats", self.handlers['stats'].handle)
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
-    )
-
-    # Use the application's context manager for clean startup and shutdown
-    async with application:
-        # 1. Start the health check server as a background task
-        health_server_task = asyncio.create_task(self._start_health_server())
-
-        # 2. Manually initialize and start the bot's components
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-
-        self.logger.info("Bot and health server are now running concurrently.")
-
-        # 3. Wait indefinitely, allowing background tasks to run
-        # This is a clean way to keep the script alive
-        await asyncio.Event().wait()
-
-        # On shutdown (e.g., Ctrl+C), cancel the health server
-        health_server_task.cancel()
+    async def health_check(self, request) -> web.Response:
+        """Health check endpoint"""
+        status = {
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'database': 'connected' if not self.db_manager.use_memory else 'in-memory',
+            'environment': self.config.environment
+        }
+        return web.Response(
+            text=json.dumps(status),
+            content_type='application/json'
+        )
+    
+    async def start_web_server(self) -> None:
+        """Start the web server for health checks"""
+        self.web_app = web.Application()
+        self.web_app.router.add_get('/', self.health_check)
+        self.web_app.router.add_get('/health', self.health_check)
+        
+        self.web_runner = web.AppRunner(self.web_app)
+        await self.web_runner.setup()
+        site = web.TCPSite(self.web_runner, '0.0.0.0', self.config.port)
+        await site.start()
+        
+        self.logger.info(f"Health check server started on port {self.config.port}")
+    
+    async def stop_web_server(self) -> None:
+        """Stop the web server"""
+        if self.web_runner:
+            await self.web_runner.cleanup()
+    
+    def run_bot(self) -> None:
+        """Run the bot using the proper method for python-telegram-bot"""
+        # Create application
+        application = (
+            Application.builder()
+            .token(self.config.bot_token)
+            .pool_timeout(30)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .build()
+        )
         
         # Add error handler
         application.add_error_handler(self.error_handler)
@@ -692,42 +680,30 @@ async def run(self) -> None:
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
         )
         
-        # Start health check server
-        asyncio.create_task(self._start_health_server())
+        # Create event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # Start the bot
-        self.logger.info("Starting bot polling...")
-        await application.run_polling(
-            poll_interval=1.0,
-            timeout=30,
-            drop_pending_updates=True
-        )
-    
-    async def _start_health_server(self) -> None:
-        """Start health check web server"""
-        app = web.Application()
-        app.router.add_get('/', self._health_check)
-        app.router.add_get('/health', self._health_check)
-        
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', self.config.port)
-        await site.start()
-        
-        self.logger.info(f"Health check server started on port {self.config.port}")
-    
-    async def _health_check(self, request) -> web.Response:
-        """Health check endpoint"""
-        status = {
-            'status': 'healthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'database': 'connected' if not self.db_manager.use_memory else 'in-memory',
-            'environment': self.config.environment
-        }
-        return web.Response(
-            text=json.dumps(status),
-            content_type='application/json'
-        )
+        try:
+            # Start web server
+            loop.run_until_complete(self.start_web_server())
+            
+            # Run the bot
+            self.logger.info("Starting bot polling...")
+            application.run_polling(
+                poll_interval=1.0,
+                timeout=30,
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+        except KeyboardInterrupt:
+            self.logger.info("Bot stopped by user")
+        except Exception as e:
+            self.logger.critical(f"Critical error: {e}", exc_info=True)
+        finally:
+            # Cleanup
+            loop.run_until_complete(self.stop_web_server())
+            loop.close()
 
 # ==================== Entry Point ====================
 
@@ -735,15 +711,12 @@ def main():
     """Main entry point"""
     try:
         bot = LevelUpBot()
+        bot.run_bot()
     except KeyboardInterrupt:
         logging.info("Bot stopped by user")
     except Exception as e:
         logging.critical(f"Critical error: {e}", exc_info=True)
         raise
 
-# THIS IS THE NEW, CORRECT CODE
-if __name__ == "__main__":
-    logging.info("Starting LevelUp Leo Bot in production mode")
-
-    bot = LevelUpBot()
-    asyncio.run(bot.run())
+if __name__ == '__main__':
+    main()
