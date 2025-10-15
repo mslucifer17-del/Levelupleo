@@ -1,6 +1,6 @@
 """
-LevelUp Leo Bot - Fixed Event Loop Version
-Production ready with proper asyncio handling
+LevelUp Leo Bot - Fixed Command Response Version
+Full working bot with proper command handling
 """
 
 import os
@@ -10,7 +10,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Union
 from contextlib import asynccontextmanager
 
@@ -42,15 +42,13 @@ class BotConfig:
     bot_token: str
     gemini_api_key: str
     database_url: str
-    group_id: int
+    group_id: Optional[int]  # Make group_id optional
     port: int
     environment: str = "production"
     log_level: str = "INFO"
     max_retries: int = 5
     retry_delay: int = 2
     message_delete_delay: int = 60
-    spotlight_interval_hours: int = 24
-    cleanup_interval_hours: int = 6
     use_database: bool = True
     
     @classmethod
@@ -58,10 +56,18 @@ class BotConfig:
         """Create config from environment variables with validation"""
         bot_token = os.environ.get('BOT_TOKEN')
         gemini_api_key = os.environ.get('GEMINI_API_KEY', 'dummy_key')
-        group_id = os.environ.get('GROUP_ID')
+        group_id_str = os.environ.get('GROUP_ID', '')
         
         if not bot_token:
             raise ValueError("BOT_TOKEN is required")
+        
+        # Handle GROUP_ID - can be empty for testing
+        group_id = None
+        if group_id_str:
+            try:
+                group_id = int(group_id_str)
+            except ValueError:
+                print(f"Warning: Invalid GROUP_ID '{group_id_str}', bot will work in all groups")
         
         # Handle DATABASE_URL properly
         database_url = os.environ.get('DATABASE_URL', 'sqlite:///levelup_bot.db')
@@ -70,19 +76,11 @@ class BotConfig:
         if database_url.startswith('postgres://'):
             database_url = database_url.replace('postgres://', 'postgresql://', 1)
         
-        # For internal Render database URLs
-        if 'dpg-' in database_url and '-a' in database_url:
-            database_url_external = os.environ.get('DATABASE_URL_EXTERNAL', database_url)
-            if database_url_external != database_url:
-                database_url = database_url_external
-                if database_url.startswith('postgres://'):
-                    database_url = database_url.replace('postgres://', 'postgresql://', 1)
-        
         return cls(
             bot_token=bot_token,
             gemini_api_key=gemini_api_key,
             database_url=database_url,
-            group_id=int(group_id) if group_id else 0,
+            group_id=group_id,
             port=int(os.environ.get('PORT', 8443)),
             environment=os.environ.get('ENVIRONMENT', 'production'),
             log_level=os.environ.get('LOG_LEVEL', 'INFO'),
@@ -102,10 +100,6 @@ class BotLogger:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # File handler
-        file_handler = logging.FileHandler("bot.log", encoding='utf-8')
-        file_handler.setFormatter(log_format)
-        
         # Console handler  
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(log_format)
@@ -113,8 +107,11 @@ class BotLogger:
         # Setup logger
         logger = logging.getLogger(__name__)
         logger.setLevel(getattr(logging, config.log_level))
-        logger.addHandler(file_handler)
         logger.addHandler(console_handler)
+        
+        # Also set telegram logger to INFO to see connection info
+        telegram_logger = logging.getLogger('telegram')
+        telegram_logger.setLevel(logging.INFO)
         
         return logger
 
@@ -143,7 +140,7 @@ class UserModel(Base):
     
     # Activity
     last_message_date = Column(DateTime, index=True)
-    join_date = Column(DateTime, default=datetime.utcnow)
+    join_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     daily_streak = Column(Integer, default=0)
     last_daily_date = Column(DateTime)
     
@@ -189,8 +186,8 @@ class InMemoryUserStore:
             'experience_points': 0,
             'hubcoins': 10,
             'reputation': 0,
-            'last_message_date': datetime.utcnow(),
-            'join_date': datetime.utcnow(),
+            'last_message_date': datetime.now(timezone.utc),
+            'join_date': datetime.now(timezone.utc),
             'daily_streak': 0,
             'last_daily_date': None,
             'vip_member': False,
@@ -360,7 +357,7 @@ class UserService:
                 return None
             
             user['messages_count'] += 1
-            user['last_message_date'] = datetime.utcnow()
+            user['last_message_date'] = datetime.now(timezone.utc)
             user['hubcoins'] += random.randint(1, 3)
             user['experience_points'] += random.randint(5, 15)
             
@@ -389,7 +386,7 @@ class UserService:
                 return None
             
             user.messages_count += 1
-            user.last_message_date = datetime.utcnow()
+            user.last_message_date = datetime.now(timezone.utc)
             user.hubcoins += random.randint(1, 3)
             user.experience_points += random.randint(5, 15)
             
@@ -415,114 +412,216 @@ class UserService:
 
 # ==================== Command Handlers ====================
 
-class StatsCommandHandler:
-    """Handler for stats command"""
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Start command received from user {update.effective_user.id}")
     
-    def __init__(self, services: Dict[str, Any], config: BotConfig, logger: logging.Logger):
-        self.services = services
-        self.config = config
-        self.logger = logger
+    welcome_text = """
+🎮 **Welcome to LevelUp Leo Bot!** 🎮
+
+I'm your leveling companion! Send messages in groups to:
+• 📈 Level up and gain experience
+• 💰 Earn HubCoins
+• 🏆 Unlock achievements
+• ⭐ Prestige at level 100
+
+**Commands:**
+/stats - View your statistics
+/help - Show all commands
+/daily - Claim daily reward
+/shop - Browse the shop
+
+Start chatting to begin your journey!
+"""
     
-    async def handle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Display user statistics"""
-        try:
-            user_service = self.services['user_service']
-            user = await user_service.get_or_create_user(update.effective_user)
-            
-            # Handle both database and in-memory users
-            if isinstance(user, dict):
-                # In-memory user
-                level = user['level']
-                experience = user['experience_points']
-                messages_count = user['messages_count']
-                hubcoins = user['hubcoins']
-                reputation = user['reputation']
-                daily_streak = user['daily_streak'] or 0
-                vip_member = user['vip_member']
-                join_date = user['join_date']
-                achievements = user.get('achievements', [])
-                prestige = user['prestige']
-                first_name = user['first_name']
-            else:
-                # Database user
-                level = user.level
-                experience = user.experience_points
-                messages_count = user.messages_count
-                hubcoins = user.hubcoins
-                reputation = user.reputation
-                daily_streak = user.daily_streak or 0
-                vip_member = user.vip_member
-                join_date = user.join_date
-                achievements = user.achievements or []
-                prestige = user.prestige
-                first_name = user.first_name
-            
-            # Calculate progress
-            next_level_exp = (level + 1) ** 2 * 50
-            current_level_exp = level ** 2 * 50
-            if next_level_exp > current_level_exp:
-                progress = ((experience - current_level_exp) / (next_level_exp - current_level_exp) * 100)
-            else:
-                progress = 100
-            progress = max(0, min(100, progress))
-            
-            # Create progress bar
-            filled = int(progress / 5)
-            progress_bar = "█" * filled + "░" * (20 - filled)
-            
-            # Build stats message
-            stats_text = f"""
+    try:
+        await update.message.reply_text(
+            welcome_text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"Start message sent to user {update.effective_user.id}")
+    except Exception as e:
+        logger.error(f"Error sending start message: {e}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Help command received from user {update.effective_user.id}")
+    
+    help_text = """
+📜 **LevelUp Leo Commands** 📜
+
+**Basic Commands:**
+/start - Start the bot
+/stats - View your level and stats
+/help - Show this help message
+
+**Economy Commands:**
+/daily - Claim daily reward
+/shop - Browse the shop
+/coins - Check your coin balance
+
+**Advanced Commands:**
+/prestige - Reset at level 100 for prestige
+/leaderboard - View top users
+
+Send messages in groups to level up!
+"""
+    
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /stats command"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Stats command received from user {update.effective_user.id}")
+    
+    try:
+        # Get services from context
+        services = context.bot_data.get('services', {})
+        user_service = services.get('user_service')
+        
+        if not user_service:
+            await update.message.reply_text("❌ Bot is still initializing. Please try again in a moment.")
+            return
+        
+        user = await user_service.get_or_create_user(update.effective_user)
+        
+        # Handle both database and in-memory users
+        if isinstance(user, dict):
+            # In-memory user
+            level = user['level']
+            experience = user['experience_points']
+            messages_count = user['messages_count']
+            hubcoins = user['hubcoins']
+            reputation = user['reputation']
+            daily_streak = user['daily_streak'] or 0
+            vip_member = user['vip_member']
+            join_date = user['join_date']
+            achievements = user.get('achievements', [])
+            prestige = user['prestige']
+            first_name = user['first_name']
+        else:
+            # Database user
+            level = user.level
+            experience = user.experience_points
+            messages_count = user.messages_count
+            hubcoins = user.hubcoins
+            reputation = user.reputation
+            daily_streak = user.daily_streak or 0
+            vip_member = user.vip_member
+            join_date = user.join_date
+            achievements = user.achievements or []
+            prestige = user.prestige
+            first_name = user.first_name
+        
+        # Calculate progress
+        next_level_exp = (level + 1) ** 2 * 50
+        current_level_exp = level ** 2 * 50
+        if next_level_exp > current_level_exp:
+            progress = ((experience - current_level_exp) / (next_level_exp - current_level_exp) * 100)
+        else:
+            progress = 100
+        progress = max(0, min(100, progress))
+        
+        # Create progress bar
+        filled = int(progress / 5)
+        progress_bar = "█" * filled + "░" * (20 - filled)
+        
+        # Build stats message
+        stats_text = f"""
 📊 **{first_name}'s Statistics** 📊
 
 **Level Progress**
-├ Level: {level} {'🌟' * prestige}
-├ Experience: {experience:,} XP
-├ Progress: {progress:.1f}%
-└ [{progress_bar}]
+• Level: {level} {'🌟' * prestige}
+• Experience: {experience:,} XP
+• Progress: {progress:.1f}%
+[{progress_bar}]
 
 **Activity Stats**
-├ Messages: {messages_count:,}
-├ Daily Streak: {daily_streak} 🔥
-└ Member Since: {join_date.strftime('%B %d, %Y')}
+• Messages: {messages_count:,}
+• Daily Streak: {daily_streak} days 🔥
+• Member Since: {join_date.strftime('%B %d, %Y')}
 
 **Economy**
-├ HubCoins: {hubcoins:,} 💰
-├ Reputation: {reputation} 👍
-└ VIP Status: {'✅ Active' if vip_member else '❌ Inactive'}
+• HubCoins: {hubcoins:,} 💰
+• Reputation: {reputation} 👍
+• VIP Status: {'✅ Active' if vip_member else '❌ Inactive'}
 
-**Achievements**
-└ Unlocked: {len(achievements)} 🏆
+**Achievements: {len(achievements)}** 🏆
 """
-            
-            # Send message
-            msg = await update.message.reply_text(
-                stats_text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # Schedule deletion
-            if self.config.message_delete_delay > 0:
-                asyncio.create_task(
-                    self._delete_message_after_delay(
-                        context.bot,
-                        update.effective_chat.id,
-                        msg.message_id
-                    )
-                )
-            
-        except Exception as e:
-            self.logger.error(f"Error in stats command: {e}", exc_info=True)
-            await update.message.reply_text(
-                "❌ An error occurred while fetching your stats. Please try again later."
-            )
+        
+        await update.message.reply_text(
+            stats_text,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"Stats sent to user {update.effective_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Error in stats command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ An error occurred while fetching your stats. Please try again later."
+        )
+
+async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /daily command"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Daily command received from user {update.effective_user.id}")
     
-    async def _delete_message_after_delay(self, bot, chat_id: int, message_id: int) -> None:
-        """Delete message after configured delay"""
-        await asyncio.sleep(self.config.message_delete_delay)
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except (BadRequest, TelegramError) as e:
-            self.logger.debug(f"Could not delete message {message_id}: {e}")
+    await update.message.reply_text(
+        "🎁 Daily rewards coming soon! Check back later.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ==================== Message Handler ====================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle regular messages for leveling"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        if not update.message or not update.effective_user:
+            return
+        
+        # Check if it's a group message
+        if update.effective_chat.type not in ['group', 'supergroup']:
+            return
+        
+        # Check if message is from the configured group (if set)
+        config = context.bot_data.get('config')
+        if config and config.group_id:
+            if update.effective_chat.id != config.group_id:
+                logger.debug(f"Message from non-target group {update.effective_chat.id}")
+                return
+        
+        logger.info(f"Processing message from user {update.effective_user.id} in group {update.effective_chat.id}")
+        
+        # Get services
+        services = context.bot_data.get('services', {})
+        user_service = services.get('user_service')
+        
+        if not user_service:
+            return
+        
+        # Update activity and check for level up
+        new_level = await user_service.update_user_activity(update.effective_user.id)
+        
+        if new_level:
+            username = update.effective_user.username or update.effective_user.first_name
+            level_up_msg = f"🎉 Congratulations {username}! You've reached Level {new_level}! 🚀"
+            
+            await update.message.reply_text(level_up_msg)
+            logger.info(f"User {update.effective_user.id} leveled up to {new_level}")
+    
+    except Exception as e:
+        logger.error(f"Error handling message: {e}", exc_info=True)
+
+# ==================== Error Handler ====================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the bot"""
+    logger = logging.getLogger(__name__)
+    logger.error(f"Exception while handling update: {context.error}", exc_info=True)
 
 # ==================== Main Bot Application ====================
 
@@ -535,14 +634,16 @@ class LevelUpBot:
             self.logger = BotLogger.setup(self.config)
             self.logger.info(f"Starting LevelUp Leo Bot in {self.config.environment} mode")
             
+            if self.config.group_id:
+                self.logger.info(f"Bot configured for group: {self.config.group_id}")
+            else:
+                self.logger.info("Bot will work in all groups (no GROUP_ID set)")
+            
             # Initialize database manager
             self.db_manager = DatabaseManager(self.config, self.logger)
             
             # Initialize services
             self._initialize_services()
-            
-            # Initialize handlers
-            self._initialize_handlers()
             
             # Initialize web server
             self.web_app = None
@@ -568,67 +669,11 @@ class LevelUpBot:
             except Exception as e:
                 self.logger.warning(f"Failed to initialize AI service: {e}")
     
-    def _initialize_handlers(self) -> None:
-        """Initialize command handlers"""
-        self.handlers = {
-            'stats': StatsCommandHandler(self.services, self.config, self.logger),
-        }
-    
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle regular messages for leveling"""
-        try:
-            if not update.message or not update.effective_user:
-                return
-            
-            # Check if message is from the configured group
-            if self.config.group_id and update.effective_chat.id != self.config.group_id:
-                return
-            
-            user_service = self.services['user_service']
-            
-            # Get or create user
-            user = await user_service.get_or_create_user(update.effective_user)
-            
-            # Update activity and check for level up
-            new_level = await user_service.update_user_activity(update.effective_user.id)
-            
-            if new_level:
-                # Send level up message
-                username = update.effective_user.username or update.effective_user.first_name
-                level_up_msg = f"🎉 Congratulations @{username}! You've reached Level {new_level}! 🚀"
-                
-                msg = await update.message.reply_text(level_up_msg)
-                
-                # Schedule deletion
-                if self.config.message_delete_delay > 0:
-                    asyncio.create_task(
-                        self._delete_message_after_delay(
-                            context.bot,
-                            update.effective_chat.id,
-                            msg.message_id
-                        )
-                    )
-        
-        except Exception as e:
-            self.logger.error(f"Error handling message: {e}", exc_info=True)
-    
-    async def _delete_message_after_delay(self, bot, chat_id: int, message_id: int) -> None:
-        """Delete message after delay"""
-        await asyncio.sleep(self.config.message_delete_delay)
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            self.logger.debug(f"Could not delete message: {e}")
-    
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle errors in the bot"""
-        self.logger.error(f"Exception while handling update: {context.error}", exc_info=True)
-    
     async def health_check(self, request) -> web.Response:
         """Health check endpoint"""
         status = {
             'status': 'healthy',
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'database': 'connected' if not self.db_manager.use_memory else 'in-memory',
             'environment': self.config.environment
         }
@@ -667,18 +712,28 @@ class LevelUpBot:
             .build()
         )
         
+        # Store config and services in bot_data for access in handlers
+        application.bot_data['config'] = self.config
+        application.bot_data['services'] = self.services
+        
         # Add error handler
-        application.add_error_handler(self.error_handler)
+        application.add_error_handler(error_handler)
         
         # Add command handlers
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("daily", daily_command))
+        
+        # Add message handler for leveling (only in groups)
         application.add_handler(
-            CommandHandler("stats", self.handlers['stats'].handle)
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+                handle_message
+            )
         )
         
-        # Add message handler for leveling
-        application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
-        )
+        self.logger.info("Registered command handlers: /start, /help, /stats, /daily")
         
         # Create event loop
         loop = asyncio.new_event_loop()
@@ -690,6 +745,8 @@ class LevelUpBot:
             
             # Run the bot
             self.logger.info("Starting bot polling...")
+            self.logger.info("Bot is ready! Send /start to begin")
+            
             application.run_polling(
                 poll_interval=1.0,
                 timeout=30,
