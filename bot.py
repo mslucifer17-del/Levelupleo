@@ -240,16 +240,21 @@ class LevelupLeoBot:
         elif query.data.startswith("shop_"):
             await self.process_shop_purchase(query, context)
 
-# main function ko file ke bahar hi rehne dein
+# === REPLACE THE OLD 'main' FUNCTION AND '__main__' BLOCK WITH THIS ===
+
 async def main():
-    """Initialize and run the bot"""
+    """Initialize and run the bot's components correctly."""
+    # 1. Initialize the main bot class
     bot = LevelupLeoBot()
 
+    # 2. Setup the database connection pool
     await bot.db.create_pool()
     await bot.db.setup_tables()
 
+    # 3. Build the Telegram application
     application = Application.builder().token(config.BOT_TOKEN).build()
 
+    # 4. Add all your command and message handlers
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("level", bot.level_command))
     application.add_handler(CommandHandler("top", bot.top_command))
@@ -258,8 +263,19 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
 
-    print("Bot polling shuru ho raha hai...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # 5. Use the application's context manager for clean startup and shutdown
+    async with application:
+        await application.initialize()  # Prepares the bot
+        await application.start()       # Starts the background tasks for handlers
+        await application.updater.start_polling() # Starts fetching updates
+
+        print("Bot is now running and polling for updates...")
+
+        # Keep the bot running forever until it's stopped
+        await asyncio.Event().wait()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped manually.")
