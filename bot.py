@@ -706,7 +706,6 @@ def main():
     """Main entry point"""
     try:
         bot = LevelUpBot()
-        asyncio.run(bot.run())
     except KeyboardInterrupt:
         logging.info("Bot stopped by user")
     except Exception as e:
