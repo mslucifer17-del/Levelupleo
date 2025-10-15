@@ -712,8 +712,9 @@ def main():
         logging.critical(f"Critical error: {e}", exc_info=True)
         raise
 
+# THIS IS THE NEW, CORRECT CODE
 if __name__ == "__main__":
     logging.info("Starting LevelUp Leo Bot in production mode")
 
     bot = LevelUpBot()
-    bot.run()
+    asyncio.run(bot.run())
