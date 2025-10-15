@@ -712,10 +712,8 @@ def main():
         logging.critical(f"Critical error: {e}", exc_info=True)
         raise
 
-import asyncio
-
 if __name__ == "__main__":
     logging.info("Starting LevelUp Leo Bot in production mode")
 
     bot = LevelUpBot()
-    asyncio.run(bot.run())
+    bot.run()
