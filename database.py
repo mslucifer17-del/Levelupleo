@@ -2,63 +2,85 @@ import asyncpg
 import os
 from datetime import datetime
 import config
+import asyncio
 
 class Database:
     def __init__(self):
         self.pool = None
     
     async def create_pool(self):
-        """Create database connection pool"""
-        self.pool = await asyncpg.create_pool(
-            config.DATABASE_URL,
-            min_size=10,
-            max_size=20
-        )
+        """Create database connection pool with retry logic"""
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                self.pool = await asyncpg.create_pool(
+                    config.DATABASE_URL,
+                    min_size=5,
+                    max_size=10
+                )
+                print("Database connection pool created successfully!")
+                return
+            except Exception as e:
+                print(f"Database connection attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise e
     
     async def setup_tables(self):
         """Create necessary database tables"""
-        async with self.pool.acquire() as conn:
-            # Users table with comprehensive data
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT,
-                    chat_id BIGINT,
-                    name VARCHAR(255),
-                    username VARCHAR(255),
-                    xp INTEGER DEFAULT 0,
-                    level INTEGER DEFAULT 0,
-                    prestige INTEGER DEFAULT 0,
-                    hubcoins INTEGER DEFAULT 0,
-                    last_message TIMESTAMP,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    custom_title VARCHAR(100),
-                    spotlight_count INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, chat_id)
-                )
-            ''')
-            
-            # Transaction history for economy
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    chat_id BIGINT,
-                    type VARCHAR(50),
-                    amount INTEGER,
-                    description TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Spotlight history
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS spotlight_history (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    chat_id BIGINT,
-                    date DATE DEFAULT CURRENT_DATE
-                )
-            ''')
+        try:
+            async with self.pool.acquire() as conn:
+                # Users table with comprehensive data
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT,
+                        chat_id BIGINT,
+                        name VARCHAR(255),
+                        username VARCHAR(255),
+                        xp INTEGER DEFAULT 0,
+                        level INTEGER DEFAULT 0,
+                        prestige INTEGER DEFAULT 0,
+                        hubcoins INTEGER DEFAULT 0,
+                        last_message TIMESTAMP,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        custom_title VARCHAR(100),
+                        spotlight_count INTEGER DEFAULT 0,
+                        PRIMARY KEY (user_id, chat_id)
+                    )
+                ''')
+                
+                # Transaction history for economy
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        chat_id BIGINT,
+                        type VARCHAR(50),
+                        amount INTEGER,
+                        description TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Spotlight history
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS spotlight_history (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        chat_id BIGINT,
+                        date DATE DEFAULT CURRENT_DATE
+                    )
+                ''')
+            print("Database tables setup completed!")
+        except Exception as e:
+            print(f"Error setting up tables: {e}")
+            raise
+    
+    # ... rest of the database methods remain the same ...
     
     async def add_user(self, user_id, name, chat_id, username=None):
         """Add new user to database"""
