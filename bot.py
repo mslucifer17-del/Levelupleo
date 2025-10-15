@@ -712,5 +712,6 @@ def main():
         logging.critical(f"Critical error: {e}", exc_info=True)
         raise
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    bot = YourBotClass()
+    bot.run()
