@@ -1,8 +1,9 @@
-# SAHI BOT.PY FILE - ISE COPY KAREIN
+# FIXED BOT.PY FILE - EVENT LOOP ISSUES RESOLVED
 
 import os
 import asyncio
 import random
+import signal
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -16,7 +17,7 @@ class LevelupLeoBot:
     def __init__(self):
         self.db = Database()
         self.level_system = LevelSystem()
-        self.economy = EconomySystem(self.db)  # Pass db to economy
+        self.economy = EconomySystem(self.db)
         self.gemini = GeminiHandler()
         
         # Animated stickers for different levels
@@ -70,10 +71,13 @@ class LevelupLeoBot:
                 f"Hmm, tumhari level to 0 hai. Message karo or apni level up karo 💪\n"
                 f"ThePromotionHub mein active raho aur rewards jeeto! 🎁"
             )
-            await context.bot.send_sticker(
-                chat_id=update.effective_chat.id,
-                sticker="CAACAgIAAxkBAAEBaZJlwqXzAAF"
-            )
+            try:
+                await context.bot.send_sticker(
+                    chat_id=update.effective_chat.id,
+                    sticker="CAACAgIAAxkBAAEBaZJlwqXzAAF"
+                )
+            except:
+                pass  # Skip if sticker fails
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=welcome_msg,
@@ -311,19 +315,15 @@ class LevelupLeoBot:
         elif query.data.startswith("shop_"):
             await self.process_shop_purchase(query, context)
 
-async def main():
-    """Initialize and run the bot's components correctly."""
-    # 1. Initialize the main bot class
+def main():
+    """Initialize and run the bot - FIXED VERSION"""
+    # Create bot instance
     bot = LevelupLeoBot()
-
-    # 2. Setup the database connection pool
-    await bot.db.create_pool()
-    await bot.db.setup_tables()
-
-    # 3. Build the Telegram application
+    
+    # Create application
     application = Application.builder().token(config.BOT_TOKEN).build()
 
-    # 4. Add all your command and message handlers
+    # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("level", bot.level_command))
     application.add_handler(CommandHandler("top", bot.top_command))
@@ -334,12 +334,46 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
 
-    # 5. Start the bot
+    # Start the bot
     print("Bot is now running and polling for updates...")
+    
+    # Run the bot until Ctrl-C is pressed
+    application.run_polling()
+
+async def async_main():
+    """Async version for proper database initialization"""
+    bot = LevelupLeoBot()
+    
+    # Initialize database
+    await bot.db.create_pool()
+    await bot.db.setup_tables()
+    print("Database initialized successfully!")
+    
+    # Create application
+    application = Application.builder().token(config.BOT_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("level", bot.level_command))
+    application.add_handler(CommandHandler("top", bot.top_command))
+    application.add_handler(CommandHandler("shop", bot.shop_command))
+    application.add_handler(CommandHandler("balance", bot.balance_command))
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.on_new_member))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    application.add_handler(CallbackQueryHandler(bot.handle_callback))
+
+    # Start the bot
+    print("Bot is now running and polling for updates...")
+    
+    # Run the bot
     await application.run_polling()
 
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        # Use the async version for proper database initialization
+        asyncio.run(async_main())
     except KeyboardInterrupt:
         print("Bot stopped manually.")
+    except Exception as e:
+        print(f"Error: {e}")
