@@ -16,7 +16,7 @@ class LevelupLeoBot:
     def __init__(self):
         self.db = Database()
         self.level_system = LevelSystem()
-        self.economy = EconomySystem()
+        self.economy = EconomySystem(self.db)  # Pass db to economy
         self.gemini = GeminiHandler()
         
         # Animated stickers for different levels
@@ -42,6 +42,11 @@ class LevelupLeoBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
         user = update.effective_user
+        chat_id = update.effective_chat.id
+        
+        # Add user to database if not exists
+        await self.db.add_user(user.id, user.first_name, chat_id, user.username)
+        
         welcome_text = (
             f"🎉 Welcome to **Levelup Leo Bot**! 🎉\n\n"
             f"Hey {user.first_name}! Mein hun Leo, tumhara level-up companion! 🦁\n\n"
@@ -84,8 +89,14 @@ class LevelupLeoBot:
         user_name = update.effective_user.first_name
         chat_id = update.effective_chat.id
         
+        # Skip if user is a bot
+        if update.effective_user.is_bot:
+            return
+        
         last_message_time = await self.db.get_last_message_time(user_id, chat_id)
-        if last_message_time and (datetime.now() - last_message_time < timedelta(seconds=60)):
+        current_time = datetime.now()
+        
+        if last_message_time and (current_time - last_message_time < timedelta(seconds=60)):
             return
         
         xp_gained = random.randint(10, 30)
@@ -110,7 +121,10 @@ class LevelupLeoBot:
     async def handle_level_up(self, update, context, user_id, user_name, old_level, new_level, chat_id):
         sticker_id = self.level_stickers.get(new_level)
         if sticker_id:
-            await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+            try:
+                await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+            except:
+                pass  # Skip if sticker fails
         
         if new_level >= 50:
             level_message = await self.gemini.generate_levelup_message(user_name, new_level)
@@ -210,22 +224,70 @@ class LevelupLeoBot:
         )
         await update.message.reply_text(shop_text, parse_mode='Markdown', reply_markup=reply_markup)
     
+    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        balance = await self.economy.get_balance(user_id, chat_id)
+        
+        balance_text = (
+            f"💰 **{update.effective_user.first_name}'s Balance**\n\n"
+            f"🪙 HubCoins: **{balance:,}**\n\n"
+            f"Use /shop to spend your coins!"
+        )
+        await update.message.reply_text(balance_text, parse_mode='Markdown')
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = (
+            "🦁 **Levelup Leo Bot - Help** 🦁\n\n"
+            "📊 **Commands:**\n"
+            "/start - Bot ko start karein\n"
+            "/level - Apna level check karein\n"
+            "/top - Top 10 members dekhein\n"
+            "/balance - Apne HubCoins check karein\n"
+            "/shop - HubCoins shop\n"
+            "/prestige - Prestige system (Level 100+)\n\n"
+            "💡 **How it works:**\n"
+            "• Har 60 seconds mein message karke XP paayein\n"
+            "• XP se level up karein\n"
+            "• Level up par HubCoins aur rewards paayein\n"
+            "• Top leaderboard par pahunchein!\n\n"
+            "Happy Leveling! 🚀"
+        )
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
     def create_progress_bar(self, percentage):
         filled = int(percentage / 10)
         bar = "█" * filled + "▒" * (10 - filled)
         return f"[{bar}]"
 
-    # ✅ IN FUNCTIONS KO CLASS KE ANDAR MOVE KAR DIYA GAYA HAI
     async def process_prestige(self, query, context):
         """Process prestige action"""
-        # Yahan prestige ka logic aayega
-        await query.edit_message_text(text="Prestige successfully liya gaya! Aap Level 1 par reset ho gaye hain. ✨")
+        user_id = int(query.data.split("_")[1])
+        chat_id = query.message.chat_id
+        
+        user_data = await self.db.get_user(user_id, chat_id)
+        if not user_data or user_data['level'] < 100:
+            await query.edit_message_text(text="Prestige ke liye Level 100 hona zaroori hai!")
+            return
+        
+        await self.db.process_prestige(user_id, chat_id)
+        await query.edit_message_text(text="✨ Prestige successfully liya gaya! Aap Level 1 par reset ho gaye hain. Aapka prestige badge mil gaya! 🎖️")
 
+    async def process_continue(self, query, context):
+        """Process continue without prestige"""
+        await query.edit_message_text(text="💪 Aapne continue karne ka faisla liya! Level 100+ ki journey shuru karein! 🚀")
+    
     async def process_shop_purchase(self, query, context):
         """Process shop purchase action"""
-        # Yahan shop ka logic aayega
         item = query.data.split("_")[1]
-        await query.edit_message_text(text=f"Aapne '{item}' khareedne ke liye select kiya. Yeh feature jald hi aayega!")
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+        
+        if item == "balance":
+            balance = await self.economy.get_balance(user_id, chat_id)
+            await query.edit_message_text(text=f"💰 Aapke paas **{balance}** HubCoins hain!", parse_mode='Markdown')
+        else:
+            await query.edit_message_text(text=f"Aapne '{item}' khareedne ke liye select kiya. Yeh feature jald hi aayega!")
     
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline button callbacks"""
@@ -236,11 +298,18 @@ class LevelupLeoBot:
             user_id = int(query.data.split("_")[1])
             if user_id == query.from_user.id:
                 await self.process_prestige(query, context)
+            else:
+                await query.edit_message_text(text="Ye option sirf aapke liye hai!")
+        
+        elif query.data.startswith("continue_"):
+            user_id = int(query.data.split("_")[1])
+            if user_id == query.from_user.id:
+                await self.process_continue(query, context)
+            else:
+                await query.edit_message_text(text="Ye option sirf aapke liye hai!")
         
         elif query.data.startswith("shop_"):
             await self.process_shop_purchase(query, context)
-
-# === REPLACE THE OLD 'main' FUNCTION AND '__main__' BLOCK WITH THIS ===
 
 async def main():
     """Initialize and run the bot's components correctly."""
@@ -259,20 +328,15 @@ async def main():
     application.add_handler(CommandHandler("level", bot.level_command))
     application.add_handler(CommandHandler("top", bot.top_command))
     application.add_handler(CommandHandler("shop", bot.shop_command))
+    application.add_handler(CommandHandler("balance", bot.balance_command))
+    application.add_handler(CommandHandler("help", bot.help_command))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot.on_new_member))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(CallbackQueryHandler(bot.handle_callback))
 
-    # 5. Use the application's context manager for clean startup and shutdown
-    async with application:
-        await application.initialize()  # Prepares the bot
-        await application.start()       # Starts the background tasks for handlers
-        await application.updater.start_polling() # Starts fetching updates
-
-        print("Bot is now running and polling for updates...")
-
-        # Keep the bot running forever until it's stopped
-        await asyncio.Event().wait()
+    # 5. Start the bot
+    print("Bot is now running and polling for updates...")
+    await application.run_polling()
 
 if __name__ == '__main__':
     try:
