@@ -4,17 +4,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bot Configuration
-BOT_TOKEN = os.getenv('8409424851:AAHkLsnj1ZdwKehAEDmT8swYHTTRAu2BB1Y')  # Your LevelupLeobot token
-BOT_USERNAME = '@@LevelUpLeobot'
+BOT_TOKEN = os.getenv('BOT_TOKEN')  # Your LevelupLeobot token
+BOT_USERNAME = '@LevelupLeobot'
 
 # Database Configuration (PostgreSQL for production)
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://db_03_10_2025_user:bAEs2tDmzNqOiEamRj1W27t1qOApw1pY@dpg-d3fnov15pdvs73bfo99g-a/db_03_10_2025')
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://user:password@localhost/levelupleo')
 
 # Gemini API Configuration
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Group Configuration
-MAIN_GROUP_ID = os.getenv('-1002989717704')  # ThePromotionHub group ID
+MAIN_GROUP_ID = os.getenv('MAIN_GROUP_ID')  # ThePromotionHub group ID
 VIP_GROUP_ID = os.getenv('VIP_GROUP_ID')  # VIP Lounge group ID
 
 # Bot Settings
