@@ -638,17 +638,46 @@ class LevelUpBot:
         """Handle errors in the bot"""
         self.logger.error(f"Exception while handling update: {context.error}", exc_info=True)
     
-    async def run(self) -> None:
-        """Run the bot application"""
-        # Create Telegram application
-        application = (
-            Application.builder()
-            .token(self.config.bot_token)
-            .pool_timeout(30)
-            .connect_timeout(30)
-            .read_timeout(30)
-            .build()
-        )
+    # In bot.py, inside the LevelUpBot class
+# Replace the ENTIRE 'run' method with this new version:
+async def run(self) -> None:
+    """Run the bot and health check server concurrently without conflict."""
+    application = (
+        Application.builder()
+        .token(self.config.bot_token)
+        .pool_timeout(30)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .build()
+    )
+
+    # Add handlers
+    application.add_error_handler(self.error_handler)
+    application.add_handler(
+        CommandHandler("stats", self.handlers['stats'].handle)
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
+    )
+
+    # Use the application's context manager for clean startup and shutdown
+    async with application:
+        # 1. Start the health check server as a background task
+        health_server_task = asyncio.create_task(self._start_health_server())
+
+        # 2. Manually initialize and start the bot's components
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+
+        self.logger.info("Bot and health server are now running concurrently.")
+
+        # 3. Wait indefinitely, allowing background tasks to run
+        # This is a clean way to keep the script alive
+        await asyncio.Event().wait()
+
+        # On shutdown (e.g., Ctrl+C), cancel the health server
+        health_server_task.cancel()
         
         # Add error handler
         application.add_error_handler(self.error_handler)
