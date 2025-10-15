@@ -9,4 +9,3 @@ asyncpg
 redis
 asyncio
 apscheduler==3.10.4
-worker: python bot.py
