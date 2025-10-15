@@ -713,5 +713,7 @@ def main():
         raise
 
 if __name__ == "__main__":
-    bot = YourBotClass()
+    logging.info("Starting LevelUpLeoBot in production mode")
+
+    bot = LevelUpLeoBot()
     bot.run()
