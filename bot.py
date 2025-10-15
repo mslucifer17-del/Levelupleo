@@ -419,4 +419,291 @@ class StatsCommandHandler(CommandHandler):
             filled = int(progress / 5)
             progress_bar = "█" * filled + "░" * (20 - filled)
             
-            # 
+            # Build stats message
+            stats_text = f"""
+📊 **{user.get_display_name()}'s Statistics** 📊
+
+**Level Progress**
+├ Level: {user.level} {'🌟' * user.prestige}
+├ Experience: {user.experience_points:,} XP
+├ Progress: {progress:.1f}%
+└ [{progress_bar}]
+
+**Activity Stats**
+├ Messages: {user.messages_count:,}
+├ Daily Streak: {user.daily_streak or 0} 🔥
+└ Member Since: {user.join_date.strftime('%B %d, %Y')}
+
+**Economy**
+├ HubCoins: {user.hubcoins:,} 💰
+├ Reputation: {user.reputation} 👍
+└ VIP Status: {'✅ Active' if user.vip_member else '❌ Inactive'}
+
+**Achievements**
+└ Unlocked: {len(user.achievements or [])} 🏆
+"""
+            
+            # Create inline keyboard
+            keyboard = [
+                [
+                    InlineKeyboardButton("🏆 Achievements", callback_data='achievements'),
+                    InlineKeyboardButton("📈 Leaderboard", callback_data='leaderboard')
+                ],
+                [InlineKeyboardButton("« Back", callback_data='main_menu')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            msg = await update.message.reply_text(
+                stats_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+            # Schedule message deletion
+            asyncio.create_task(
+                self._delete_message_after_delay(
+                    context.bot,
+                    update.effective_chat.id,
+                    msg.message_id
+                )
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in stats command: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again later."
+            )
+    
+    async def _delete_message_after_delay(self, bot, chat_id: int, message_id: int) -> None:
+        """Delete message after configured delay"""
+        await asyncio.sleep(self.config.message_delete_delay)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except (BadRequest, TelegramError) as e:
+            self.logger.warning(f"Could not delete message {message_id}: {e}")
+
+# ==================== Shop System ====================
+
+@dataclass
+class ShopItem:
+    """Shop item data class"""
+    id: str
+    name: str
+    description: str
+    price: int
+    icon: str
+    category: str
+    duration_days: Optional[int] = None
+
+class ShopService:
+    """Service for managing the shop"""
+    
+    ITEMS = {
+        'custom_title': ShopItem(
+            'custom_title', 'Custom Title', 
+            'Display a custom title for 7 days', 1000, '🎭', 'cosmetic', 7
+        ),
+        'spotlight': ShopItem(
+            'spotlight', 'Spotlight Priority', 
+            'Get priority in daily spotlight', 2500, '🌟', 'feature', None
+        ),
+        'vip_status': ShopItem(
+            'vip_status', 'VIP Membership', 
+            'Permanent VIP status with exclusive perks', 10000, '👑', 'premium', None
+        ),
+        'coin_boost': ShopItem(
+            'coin_boost', 'Coin Boost', 
+            'Double coins for 24 hours', 500, '💰', 'boost', 1
+        ),
+    }
+    
+    def __init__(self, db_manager: DatabaseManager, logger: logging.Logger):
+        self.db = db_manager
+        self.logger = logger
+    
+    async def purchase_item(self, user_id: int, item_id: str, **kwargs) -> Tuple[bool, str]:
+        """Process item purchase"""
+        item = self.ITEMS.get(item_id)
+        if not item:
+            return False, "Item not found in shop"
+        
+        async with self.db.get_session() as session:
+            user = await asyncio.to_thread(
+                session.query(UserModel).filter(UserModel.user_id == user_id).first
+            )
+            
+            if not user:
+                return False, "User not found"
+            
+            if user.hubcoins < item.price:
+                return False, f"Insufficient coins. You need {item.price:,} coins."
+            
+            # Process purchase based on item type
+            user.hubcoins -= item.price
+            
+            if item_id == 'custom_title':
+                title = kwargs.get('title', 'VIP')[:20]
+                user.custom_title = title
+                user.custom_title_expiry = datetime.utcnow() + timedelta(days=item.duration_days)
+                message = f"Custom title '{title}' activated for 7 days!"
+            
+            elif item_id == 'spotlight':
+                user.spotlight_priority = True
+                message = "Spotlight priority activated! You'll be featured soon."
+            
+            elif item_id == 'vip_status':
+                user.vip_member = True
+                message = "Welcome to VIP! Enjoy your exclusive perks."
+            
+            else:
+                message = f"Purchased {item.name} successfully!"
+            
+            await asyncio.to_thread(session.commit)
+            self.logger.info(f"User {user_id} purchased {item_id}")
+            
+            return True, message
+
+# ==================== AI Service ====================
+
+class AIService:
+    """Service for AI-powered features"""
+    
+    def __init__(self, api_key: str, logger: logging.Logger):
+        self.logger = logger
+        self.model = None
+        self._initialize_ai(api_key)
+    
+    def _initialize_ai(self, api_key: str) -> None:
+        """Initialize Gemini AI"""
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            self.logger.info("AI service initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize AI service: {e}")
+            self.model = None
+    
+    async def generate_level_message(self, level: int, username: str) -> str:
+        """Generate creative level-up message"""
+        if not self.model:
+            return self._get_fallback_message(level, username)
+        
+        prompt = (
+            f"Create a very short, energetic congratulations message for {username} "
+            f"who just reached Level {level}. Use emojis and be creative. "
+            f"Maximum 2 sentences. Mix English with a bit of Hindi/Hinglish."
+        )
+        
+        try:
+            response = await asyncio.to_thread(
+                self.model.generate_content,
+                prompt,
+                generation_config={'temperature': 0.9, 'max_output_tokens': 100}
+            )
+            return response.text.strip()
+        except Exception as e:
+            self.logger.error(f"AI generation failed: {e}")
+            return self._get_fallback_message(level, username)
+    
+    def _get_fallback_message(self, level: int, username: str) -> str:
+        """Fallback messages when AI is unavailable"""
+        messages = [
+            f"🎉 Amazing {username}! Level {level} unlocked! Keep crushing it! 🚀",
+            f"🔥 {username} just hit Level {level}! Absolute legend! 💪",
+            f"⚡ Level {level} achieved! {username} is on fire! 🌟",
+            f"🏆 Congratulations {username}! Level {level} conquered! 👑",
+        ]
+        return random.choice(messages)
+
+# ==================== Main Bot Application ====================
+
+class LevelUpBot:
+    """Main bot application class"""
+    
+    def __init__(self):
+        self.config = BotConfig.from_env()
+        self.logger = BotLogger.setup(self.config)
+        self.db_manager = DatabaseManager(self.config, self.logger)
+        self._initialize_services()
+        self._initialize_handlers()
+    
+    def _initialize_services(self) -> None:
+        """Initialize all services"""
+        self.services = {
+            'user_service': UserService(self.db_manager, self.logger),
+            'achievement_service': AchievementService(self.db_manager, self.logger),
+            'shop_service': ShopService(self.db_manager, self.logger),
+            'ai_service': AIService(self.config.gemini_api_key, self.logger),
+        }
+    
+    def _initialize_handlers(self) -> None:
+        """Initialize command handlers"""
+        self.handlers = {
+            'stats': StatsCommandHandler(self.services, self.config, self.logger),
+        }
+    
+    async def run(self) -> None:
+        """Run the bot application"""
+        # Create Telegram application
+        application = (
+            Application.builder()
+            .token(self.config.bot_token)
+            .pool_timeout(30)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .build()
+        )
+        
+        # Register command handlers
+        application.add_handler(
+            CommandHandler("stats", self.handlers['stats'].handle)
+        )
+        
+        # Start health check server
+        asyncio.create_task(self._start_health_server())
+        
+        # Start the bot
+        self.logger.info("Starting LevelUp Leo Bot...")
+        await application.run_polling(
+            poll_interval=1.0,
+            timeout=30,
+            drop_pending_updates=True
+        )
+    
+    async def _start_health_server(self) -> None:
+        """Start health check web server for deployment"""
+        app = web.Application()
+        app.router.add_get('/health', self._health_check)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', self.config.port)
+        await site.start()
+        
+        self.logger.info(f"Health check server started on port {self.config.port}")
+    
+    async def _health_check(self, request) -> web.Response:
+        """Health check endpoint"""
+        return web.Response(
+            text=json.dumps({
+                'status': 'healthy',
+                'timestamp': datetime.utcnow().isoformat()
+            }),
+            content_type='application/json'
+        )
+
+# ==================== Entry Point ====================
+
+def main():
+    """Main entry point"""
+    try:
+        bot = LevelUpBot()
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+    except Exception as e:
+        logging.critical(f"Critical error: {e}")
+        raise
+
+if __name__ == '__main__':
+    main()
