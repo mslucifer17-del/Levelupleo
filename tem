@@ -1,0 +1,198 @@
+async def admin_post_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Smart Post Generator (Supports Photo AND Video)
+    Updated: Supports comma separation for Custom Text
+    Example: /post_query Kalki, Hindi HD
+    """
+    try:
+        # 1. Permission Check
+        user_id = update.effective_user.id
+        if user_id != ADMIN_USER_ID:
+            return
+
+        message = update.message
+        
+        # 2. Validate Media (Check if Photo OR Video exists)
+        if not (message.photo or message.video):
+            await message.reply_text("❌ Photo ya Video bhejo caption ke sath: `/post_query Name`", parse_mode='Markdown')
+            return
+
+        caption_text = message.caption
+        if not caption_text or not caption_text.startswith('/post_query'):
+            return
+
+        # 3. Extract File ID & Type
+        file_id = None
+        media_type = 'photo' # Default
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            media_type = 'photo'
+        elif message.video:
+            file_id = message.video.file_id
+            media_type = 'video'
+
+        # =========================================================
+        # 4. Clean Query & Split Logic (UPDATED HERE)
+        # =========================================================
+        raw_input = caption_text.replace('/post_query', '').strip()
+        
+        # Check for comma to split DB Name and Custom Msg
+        if ',' in raw_input:
+            parts = raw_input.split(',', 1) # Split only on first comma
+            query_text = parts[0].strip()   # Ye DB me search hoga (e.g. Kalki)
+            custom_msg = parts[1].strip()   # Ye caption me dikhega (e.g. Hindi HD)
+        else:
+            query_text = raw_input
+            custom_msg = ""
+
+        if not query_text:
+            await message.reply_text("❌ Name missing.")
+            return
+
+        # =========================================================
+        # 🧠 SMART DATABASE CHECK
+        # =========================================================
+        movie_id = None
+        conn = get_db_connection()
+
+        if conn:
+            try:
+                cur = conn.cursor()
+                sql = """
+                    SELECT m.id 
+                    FROM movies m
+                    LEFT JOIN movie_aliases ma ON m.id = ma.movie_id
+                    WHERE m.title ILIKE %s OR ma.alias ILIKE %s
+                    LIMIT 1
+                """
+                cur.execute(sql, (query_text.strip(), query_text.strip()))
+                row = cur.fetchone()
+                if row:
+                    movie_id = row[0]
+                cur.close()
+                close_db_connection(conn)
+            except Exception as e:
+                logger.error(f"Error finding movie ID: {e}")
+                if conn: close_db_connection(conn)
+
+        # =========================================================
+        # 🔗 LINK GENERATION
+        # =========================================================
+        bot1_username = "FlimfyBox_SearchBot"
+        bot2_username = "urmoviebot"
+        bot3_username = "FlimfyBox_Bot"
+        
+        link_param = ""
+        log_message = ""
+
+        if movie_id:
+            link_param = f"movie_{movie_id}"
+            log_message = f"✅ **FAST MODE (ID Found: {movie_id})**"
+        else:
+            safe_query = re.sub(r'[^\w\s-]', '', query_text).replace(" ", "_")
+            safe_query = re.sub(r'_+', '_', safe_query).strip('_')
+            link_param = f"q_{safe_query}"
+            log_message = f"⚠️ **SLOW MODE (Name Search)**\n(Movie DB me nahi mili)"
+
+        link1 = f"https://t.me/{bot1_username}?start={link_param}"
+        link2 = f"https://t.me/{bot2_username}?start={link_param}"
+        link3 = f"https://t.me/{bot3_username}?start={link_param}"
+
+        # Keyboard
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Download Now", url=link1),
+                InlineKeyboardButton("Download Now", url=link2),
+            ],
+            [
+                InlineKeyboardButton("Download Now", url=link3)
+            ],
+            [InlineKeyboardButton("📢 Join Channel", url=FILMFYBOX_CHANNEL_URL)]
+        ])
+
+        # Caption (UPDATED HERE to include custom_msg)
+        channel_caption = f"🎬 <b>{query_text}</b>\n"
+        
+        # Agar custom message (comma ke baad wala text) hai to add karein
+        if custom_msg:
+            channel_caption += f"✨ <b>{custom_msg}</b>\n\n"
+        else:
+            channel_caption += "\n"
+
+        channel_caption += (
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"🔹 <b>Support group:</b> <a href='https://t.me/+2hFeRL4DYfBjZDQ1'>Request & Search Movies</a>\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"<b>🧙‍♂️Download Below:👇</b>\n"
+        )
+
+        # =========================================================
+        # 📤 SENDING POST (Smart Send)
+        # =========================================================
+        channels_str = os.environ.get('BROADCAST_CHANNELS', str(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else "")
+        target_channels = [ch.strip() for ch in channels_str.split(',') if ch.strip()]
+
+        if target_channels:
+            sent_count = 0
+            failed_count = 0
+            
+            for chat_id in target_channels:
+                try:
+                    # Check Media Type and Send Accordingly
+                    if media_type == 'video':
+                        await context.bot.send_video(
+                            chat_id=chat_id,
+                            video=file_id,
+                            caption=channel_caption,
+                            reply_markup=keyboard,
+                            parse_mode='HTML'
+                        )
+                    else:
+                        await context.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=file_id,
+                            caption=channel_caption,
+                            reply_markup=keyboard,
+                            parse_mode='HTML'
+                        )
+                    # 👇👇👇 YE WALA PART TUMHARE CODE ME MISSING THA 👇👇👇
+                    if sent_msg:
+                        try:
+                            # DB Connection kholo sirf save karne ke liye
+                            conn_save = get_db_connection()
+                            cur_save = conn_save.cursor()
+                            
+                            # Data Insert Karo
+                            cur_save.execute(
+                                "INSERT INTO channel_posts (movie_id, channel_id, message_id, bot_username) VALUES (%s, %s, %s, %s)",
+                                (movie_id, chat_id, sent_msg.message_id, "FlimfyBox_Bot") 
+                            )
+                            conn_save.commit()
+                            cur_save.close()
+                            conn_save.close()
+                            logger.info(f"✅ Post saved to DB: MsgID {sent_msg.message_id}")
+                        except Exception as db_e:
+                            logger.error(f"Failed to save post to DB: {db_e}")
+                    # 👆👆👆 YAHAN TAK 👆👆👆
+                    
+                    sent_count += 1
+                except Exception as post_error:
+                    logger.error(f"Failed to post to {chat_id}: {post_error}")
+                    failed_count += 1
+            
+            await message.reply_text(
+                f"✅ Post Processed ({media_type.capitalize()})!\n\n"
+                f"📤 Sent to: {sent_count}\n"
+                f"❌ Failed: {failed_count}\n\n"
+                f"{log_message}\n"
+                f"Query: `{query_text}`\n"
+                f"Extra Info: `{custom_msg}`",
+                parse_mode='Markdown'
+            )
+        else:
+            await message.reply_text("❌ No Channels Configured.")
+
+    except Exception as e:
+        logger.error(f"Error in admin_post_query: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
